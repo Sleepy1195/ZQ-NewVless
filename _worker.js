@@ -177,6 +177,8 @@ export default {
                     domains: [],
                     ports: [],
                     fallbackTimeout: 100,
+                    bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
+                    autoUpdateBestIp: false,
                 };
                 // 兼容旧格式：将字符串数组转换为对象数组
                 if (Array.isArray(merged.domains)) {
@@ -194,6 +196,8 @@ export default {
                     typeof merged.fallbackTimeout === "number"
                         ? Math.max(1, Math.min(5000, merged.fallbackTimeout))
                         : 100;
+                merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
+                merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
                 const d = (merged.domain || "").trim();
                 if (d && !merged.domains.some((x) => x.ip === d))
                     merged.domains.unshift({ ip: d, remark: "" });
@@ -213,6 +217,8 @@ export default {
                     domains: [],
                     ports: [443],
                     fallbackTimeout: 100,
+                    bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
+                    autoUpdateBestIp: false,
                 };
             }
         };
@@ -699,6 +705,49 @@ export default {
 
         const url = new URL(req.url);
 
+        if (url.pathname.startsWith("/api/fetch-best-ip/")) {
+            const pathParts = url.pathname.split("/").filter((p) => p);
+            const urlUUID = pathParts[2];
+            if (!urlUUID) return json({ error: "UUID不能为空" }, 400);
+            const userConfig = await getUserConfig();
+            if (urlUUID !== userConfig.uuid) return json({ error: "UUID错误，无权访问" }, 403);
+            
+            // 从请求体读取API地址，如果没有则用配置里的
+            let apiUrl = userConfig.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
+            try {
+                const body = await req.json();
+                if (body.apiUrl) {
+                    apiUrl = body.apiUrl;
+                }
+            } catch (e) {
+                // 请求体可能不存在，忽略
+            }
+            
+            try {
+                const response = await fetch(apiUrl, {
+                    headers: {
+                        "Accept": "text/html,application/xhtml+xml,application/xml;",
+                        "User-Agent": "cmliu/CF-Workers-DD2D",
+                    },
+                });
+                if (!response.ok) {
+                    throw new Error(`API请求失败: ${response.status}`);
+                }
+                const text = await response.text();
+                const ips = text
+                    .split(/[\n\r,]+/)
+                    .map((ip) => ip.trim())
+                    .filter((ip) => {
+                        const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+                        const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::1$|^::$|^(?:[0-9a-fA-F]{1,4}:){1,7}:$|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}$|^(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}$|^(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}$|^[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}$|^:(?::[0-9a-fA-F]{1,4}){1,7}$/;
+                        return ipv4Regex.test(ip) || ipv6Regex.test(ip);
+                    });
+                return json({ success: true, ips: ips });
+            } catch (error) {
+                return json({ success: false, error: error.message }, 500);
+            }
+        }
+
         if (url.pathname.startsWith("/api/config/")) {
             const pathParts = url.pathname.split("/").filter((p) => p);
             const urlUUID = pathParts[2];
@@ -768,6 +817,8 @@ export default {
                         domains: domains,
                         ports: ports,
                         fallbackTimeout,
+                        bestIpApi: incoming.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf",
+                        autoUpdateBestIp: !!incoming.autoUpdateBestIp,
                     };
                     if (env.VTPanel)
                         await env.VTPanel.put("user_config", JSON.stringify(normalized));
@@ -1650,6 +1701,22 @@ export default {
 							<div class="label-with-link">
 								<label>优选IP(可选)</label>
 								<a href="https://ipdb.030101.xyz/bestcfv4/" target="_blank" rel="nofollow noopener" class="link-arrow" title="优选IP地址">↗</a>
+								<button type="button" id="toggleBestIpSettings" style="margin-left: 8px; padding: 6px 12px; min-width: auto; flex: none; background: #DAE9FE; color: #2563eb; border-radius: 10px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .3s ease; display: inline-flex; align-items: center; justify-content: center;">自动优选</button>
+							</div>
+							<div id="bestIpSettings" style="display: none; margin-bottom: 12px; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #bfdbfe;">
+								<div style="margin-bottom: 8px;">
+									<label style="font-size: 13px; font-weight: 600; color: #64748b;">优选IP API地址</label>
+									<input type="text" id="bestIpApi" placeholder="https://ipdb.api.030101.xyz/?type=bestcf" style="width: 100%; margin-top: 4px; padding: 8px 12px; border: 2px solid #bfdbfe; border-radius: 6px; font-size: 13px;">
+								</div>
+								<div style="margin-bottom: 8px;">
+									<label style="display: flex; align-items: center; font-size: 13px; font-weight: 600; color: #64748b;">
+										<input type="checkbox" id="autoUpdateBestIp" style="margin-right: 8px;">
+										自动获取优选IP
+									</label>
+								</div>
+								<div class="button-group" style="margin-bottom: 0;">
+									<button type="button" id="fetchBestIp" class="btn btn-success" style="flex: 1; min-width: auto; padding: 10px 16px; font-size: 13px;">🔄获取优选IP</button>
+								</div>
 							</div>
 							<div id="domains" class="list"></div>
 							<div class="input-group">
@@ -1916,6 +1983,8 @@ export default {
 			            document.getElementById('s5').value = cfg.s5 || '';
 			            document.getElementById('proxyIp').value = cfg.proxyIp || '';
 			            document.getElementById('fallbackTimeout').value = cfg.fallbackTimeout || 100;
+			            document.getElementById('bestIpApi').value = cfg.bestIpApi || 'https://ipdb.api.030101.xyz/?type=bestcf';
+			            document.getElementById('autoUpdateBestIp').checked = !!cfg.autoUpdateBestIp;
 			            
 			            if (Array.isArray(cfg.domains)) {
 			                state.domains = cfg.domains.map(item => {
@@ -1954,6 +2023,8 @@ export default {
 			        const s5 = document.getElementById('s5').value.trim();
 			        const proxyIp = document.getElementById('proxyIp').value.trim();
 			        const fallbackTimeout = parseInt(document.getElementById('fallbackTimeout').value, 10) || 100;
+			        const bestIpApi = document.getElementById('bestIpApi').value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
+			        const autoUpdateBestIp = document.getElementById('autoUpdateBestIp').checked;
 			        
 			        const domainItems = Array.from(document.querySelectorAll('#domains .list-item'));
 			        const domains = [];
@@ -1970,7 +2041,7 @@ export default {
 			            .map(i => parseInt(i.value, 10))
 			            .filter(n => n > 0 && n <= 65535);
 			        
-			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout };
+			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp };
 			        
 			        const response = await fetch('/api/config/' + uuid, {
 			            method: 'POST',
@@ -2014,6 +2085,8 @@ export default {
 			        const domainRemarkNew = document.getElementById('domainRemarkNew');
 			        const portNew = document.getElementById('portNew');
 			        const reloadBtn = document.getElementById('reloadBtn');
+			        const toggleBestIpSettings = document.getElementById('toggleBestIpSettings');
+			        const fetchBestIp = document.getElementById('fetchBestIp');
 			        
 			        addDomain && addDomain.addEventListener('click', () => {
 			            const v = (domainNew.value || '').trim();
@@ -2036,6 +2109,54 @@ export default {
 			        reloadBtn && reloadBtn.addEventListener('click', () => {
 			            loadConfig();
 			        });
+			        
+			        toggleBestIpSettings && toggleBestIpSettings.addEventListener('click', () => {
+			            const settings = document.getElementById('bestIpSettings');
+			            if (settings.style.display === 'none') {
+			                settings.style.display = 'block';
+			            } else {
+			                settings.style.display = 'none';
+			            }
+			        });
+			        
+			        fetchBestIp && fetchBestIp.addEventListener('click', async () => {
+			            const uuid = document.getElementById('uuid').value.trim() || '${userUUID}';
+			            const bestIpApiInput = document.getElementById('bestIpApi');
+			            const apiUrl = bestIpApiInput.value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
+			            
+			            const originalText = fetchBestIp.textContent;
+			            fetchBestIp.textContent = '⏳ 获取中...';
+			            fetchBestIp.disabled = true;
+			            
+			            try {
+			                const response = await fetch('/api/fetch-best-ip/' + uuid, {
+			                    method: 'POST',
+			                    headers: { 'Content-Type': 'application/json' },
+			                    body: JSON.stringify({ apiUrl })
+			                });
+			                const result = await response.json();
+			                
+			                if (result.success && result.ips && result.ips.length > 0) {
+			                    const existingIps = new Set(state.domains.map(d => d.ip));
+			                    let addedCount = 0;
+			                    result.ips.forEach(ip => {
+			                        if (!existingIps.has(ip)) {
+			                            state.domains.push({ ip, remark: '优选IP' });
+			                            addedCount++;
+			                        }
+			                    });
+			                    renderList(document.getElementById('domains'), state.domains, '', false);
+			                    showMessage('✅ 成功添加 ' + addedCount + ' 个优选IP', 'success');
+			                } else {
+			                    showMessage('❌ 未获取到优选IP', 'error');
+			                }
+			            } catch (error) {
+			                showMessage('❌ 获取优选IP失败: ' + error.message, 'error');
+			            } finally {
+			                fetchBestIp.textContent = originalText;
+			                fetchBestIp.disabled = false;
+			            }
+			        });
 			    });
 			
 			    document.getElementById('configForm').addEventListener('submit', function(e) {
@@ -2051,5 +2172,142 @@ export default {
             return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
         }
         return new Response("Not Found", { status: 404 });
+    },
+    async scheduled(event, env, ctx) {
+        try {
+            const getUserConfig = async () => {
+                try {
+                    const config = await env.VTPanel?.get("user_config", "json");
+                    const merged = config || {
+                        uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
+                        domain: "",
+                        port: "443",
+                        s5: "",
+                        proxyIp: "",
+                        domains: [],
+                        ports: [],
+                        fallbackTimeout: 100,
+                        bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
+                        autoUpdateBestIp: false,
+                    };
+                    // 兼容旧格式：将字符串数组转换为对象数组
+                    if (Array.isArray(merged.domains)) {
+                        merged.domains = merged.domains.map((item) => {
+                            if (typeof item === "string") {
+                                return { ip: item, remark: "" };
+                            }
+                            return item;
+                        });
+                    } else {
+                        merged.domains = [];
+                    }
+                    merged.ports = Array.isArray(merged.ports) ? merged.ports : [];
+                    merged.fallbackTimeout =
+                        typeof merged.fallbackTimeout === "number"
+                            ? Math.max(1, Math.min(5000, merged.fallbackTimeout))
+                            : 100;
+                    merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
+                    merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
+                    return merged;
+                } catch {
+                    return {
+                        uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
+                        domain: "",
+                        port: "443",
+                        s5: "",
+                        proxyIp: "",
+                        domains: [],
+                        ports: [443],
+                        fallbackTimeout: 100,
+                        bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
+                        autoUpdateBestIp: false,
+                    };
+                }
+            };
+
+            const cfg = await getUserConfig();
+            if (!cfg.autoUpdateBestIp || !cfg.bestIpApi) {
+                console.log("Auto update best IP is disabled or no API configured");
+                return;
+            }
+
+            console.log("Starting scheduled best IP update");
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+
+            try {
+                const response = await fetch(cfg.bestIpApi, {
+                    method: 'get',
+                    headers: {
+                        "Accept": "text/html,application/xhtml+xml,application/xml;",
+                        "User-Agent": "cmliu/CF-Workers-DD2D",
+                    },
+                    signal: controller.signal,
+                });
+
+                if (!response.ok) {
+                    throw new Error(`API request failed: ${response.status}`);
+                }
+
+                const text = await response.text();
+                const newIps = text.replace(/[ \t\r\n]+/g, ',').replace(/,+/g, ',').replace(/^,|,$/g, '').split(',').filter(Boolean);
+                const ipv4Regex = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+                const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9])?[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9])?[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9])?[0-9]))$/;
+
+                const ips = newIps.filter(ip => ipv4Regex.test(ip) || ipv6Regex.test(ip));
+
+                if (ips.length > 0) {
+                    let domains = Array.isArray(cfg.domains)
+                        ? cfg.domains.map((item) => {
+                            if (typeof item === 'string') {
+                                return { ip: item, remark: '' };
+                            }
+                            return item;
+                        }).filter(x => x && x.ip)
+                        : [];
+
+                    if (cfg.domain && !domains.some(x => x.ip === cfg.domain)) {
+                        domains.unshift({ ip: cfg.domain, remark: '' });
+                    }
+
+                    const existingIps = new Set(domains.map(d => d.ip));
+                    const nonPreferredIps = domains.filter(d => d.remark !== '优选IP');
+                    const preferredIps = ips
+                        .filter(ip => !existingIps.has(ip))
+                        .map(ip => ({ ip, remark: '优选IP' }));
+
+                    domains = [...nonPreferredIps, ...preferredIps];
+
+                    if (domains.length > 20) {
+                        domains = domains.slice(0, 20);
+                    }
+
+                    const normalized = {
+                        uuid: cfg.uuid,
+                        domain: domains[0]?.ip || '',
+                        port: cfg.port,
+                        s5: cfg.s5 || '',
+                        proxyIp: cfg.proxyIp || '',
+                        domains: domains,
+                        ports: cfg.ports || [443],
+                        fallbackTimeout: cfg.fallbackTimeout || 100,
+                        bestIpApi: cfg.bestIpApi,
+                        autoUpdateBestIp: cfg.autoUpdateBestIp,
+                    };
+
+                    if (env.VTPanel) {
+                        await env.VTPanel.put("user_config", JSON.stringify(normalized));
+                    }
+
+                    console.log(`Successfully updated ${preferredIps.length} best IPs`);
+                } else {
+                    console.log("No valid IPs received from API");
+                }
+            } finally {
+                clearTimeout(timeout);
+            }
+        } catch (error) {
+            console.error("Error in scheduled best IP update:", error);
+        }
     },
 };
