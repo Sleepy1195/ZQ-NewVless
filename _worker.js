@@ -179,6 +179,8 @@ export default {
                     fallbackTimeout: 100,
                     bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
                     autoUpdateBestIp: false,
+                    nodeTypes: ["direct"],
+                    protocols: ["vless", "trojan"],
                 };
                 // 兼容旧格式：将字符串数组转换为对象数组
                 if (Array.isArray(merged.domains)) {
@@ -198,6 +200,13 @@ export default {
                         : 100;
                 merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
                 merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
+                // 兼容旧配置：补齐缺失的 nodeTypes 和 protocols
+                if (!Array.isArray(merged.nodeTypes) || merged.nodeTypes.length === 0) {
+                    merged.nodeTypes = ["direct"];
+                }
+                if (!Array.isArray(merged.protocols) || merged.protocols.length === 0) {
+                    merged.protocols = ["vless", "trojan"];
+                }
                 const d = (merged.domain || "").trim();
                 if (d && !merged.domains.some((x) => x.ip === d))
                     merged.domains.unshift({ ip: d, remark: "" });
@@ -219,6 +228,8 @@ export default {
                     fallbackTimeout: 100,
                     bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
                     autoUpdateBestIp: false,
+                    nodeTypes: ["direct"],
+                    protocols: ["vless", "trojan"],
                 };
             }
         };
@@ -238,15 +249,28 @@ export default {
         const buildTrojanUri = (rawPathQuery, uuid, label, workerHost, preferredDomain, port) =>
             `trojan://${uuid}@${preferredDomain}:${port}?security=tls&sni=${workerHost}&type=ws&host=${workerHost}&path=${encodeURIComponent(rawPathQuery)}#${encodeURIComponent(label || preferredDomain)}`;
 
-        const buildVariants = (s5, proxyIp) => {
-            const v = [{ label: "直连", raw: buildPath("d", 1, null, null) }];
-            if (s5) {
+        const buildVariants = (s5, proxyIp, nodeTypes) => {
+            const v = [];
+            const types = Array.isArray(nodeTypes) && nodeTypes.length > 0 ? nodeTypes : ["direct"];
+            if (types.includes("direct")) {
+                v.push({ label: "直连", raw: buildPath("d", 1, null, null) });
+            }
+            if (s5 && types.includes("s5")) {
                 v.push({ label: "SOCKS5", raw: buildPath("s", null, s5, null) });
+            }
+            if (s5 && types.includes("direct_s5")) {
                 v.push({ label: "直连+SOCKS5", raw: buildPath("p", 1, s5, null) });
             }
-            if (proxyIp) v.push({ label: "直连+ProxyIP", raw: buildPath("p", 1, null, proxyIp) });
-            if (s5 && proxyIp)
+            if (proxyIp && types.includes("direct_proxy")) {
+                v.push({ label: "直连+ProxyIP", raw: buildPath("p", 1, null, proxyIp) });
+            }
+            if (s5 && proxyIp && types.includes("direct_s5_proxy")) {
                 v.push({ label: "直连+SOCKS5+ProxyIP", raw: buildPath("p", 1, s5, proxyIp) });
+            }
+            // 至少要有一个变体
+            if (v.length === 0) {
+                v.push({ label: "直连", raw: buildPath("d", 1, null, null) });
+            }
             return v;
         };
 
@@ -275,6 +299,7 @@ export default {
             const userConfig = await getUserConfig();
             const [client, ws] = Object.values(new WebSocketPair());
             ws.accept();
+            ws.binaryType = 'arraybuffer';
 
             if (u.pathname.includes("%3F")) {
                 const decoded = decodeURIComponent(u.pathname);
@@ -819,6 +844,12 @@ export default {
                         fallbackTimeout,
                         bestIpApi: incoming.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf",
                         autoUpdateBestIp: !!incoming.autoUpdateBestIp,
+                        nodeTypes: Array.isArray(incoming.nodeTypes) && incoming.nodeTypes.length > 0
+                            ? incoming.nodeTypes
+                            : ["direct"],
+                        protocols: Array.isArray(incoming.protocols) && incoming.protocols.length > 0
+                            ? incoming.protocols
+                            : ["vless", "trojan"],
                     };
                     if (env.VTPanel)
                         await env.VTPanel.put("user_config", JSON.stringify(normalized));
@@ -836,7 +867,7 @@ export default {
             const userConfig = await getUserConfig();
             if (inputUUID !== userConfig.uuid) return new Response("Not Found", { status: 404 });
             const { workerHost, domains, ports } = getDomainPortLists(req, userConfig);
-            const variants = buildVariants(userConfig.s5, userConfig.proxyIp);
+            const variants = buildVariants(userConfig.s5, userConfig.proxyIp, userConfig.nodeTypes);
             const ua = (req.headers.get("User-Agent") || "").toLowerCase();
             const isSubConverterRequest =
                 url.searchParams.has("b64") ||
@@ -866,26 +897,33 @@ export default {
                             ? "loon"
                             : "mixed";
             const out = [];
+            const protocols = Array.isArray(userConfig.protocols) && userConfig.protocols.length > 0
+                ? userConfig.protocols
+                : ["vless", "trojan"];
             for (const d of domains) {
                 for (const p of ports) {
                     for (const v of variants) {
-                        const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
-                        const trojanName = d.remark
-                            ? `T ${v.label} ${d.remark}`
-                            : `T ${v.label}  ${d.ip}:${p}`;
-                        out.push(
-                            buildVlessUri(v.raw, userConfig.uuid, vlessName, workerHost, d.ip, p),
-                        );
-                        out.push(
-                            buildTrojanUri(
-                                v.raw,
-                                userConfig.uuid,
-                                trojanName,
-                                workerHost,
-                                d.ip,
-                                p,
-                            ),
-                        );
+                        if (protocols.includes("vless")) {
+                            const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
+                            out.push(
+                                buildVlessUri(v.raw, userConfig.uuid, vlessName, workerHost, d.ip, p),
+                            );
+                        }
+                        if (protocols.includes("trojan")) {
+                            const trojanName = d.remark
+                                ? `T ${v.label} ${d.remark}`
+                                : `T ${v.label}  ${d.ip}:${p}`;
+                            out.push(
+                                buildTrojanUri(
+                                    v.raw,
+                                    userConfig.uuid,
+                                    trojanName,
+                                    workerHost,
+                                    d.ip,
+                                    p,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -1091,28 +1129,35 @@ export default {
             const origin = new URL(req.url).origin;
             const subUrl = `${origin}/sub/${userUUID}`;
             const lists = getDomainPortLists(req, userConfig);
-            const variants = buildVariants(userConfig.s5, userConfig.proxyIp);
+            const variants = buildVariants(userConfig.s5, userConfig.proxyIp, userConfig.nodeTypes);
             const allNodeUris = [];
+            const protocols = Array.isArray(userConfig.protocols) && userConfig.protocols.length > 0
+                ? userConfig.protocols
+                : ["vless", "trojan"];
             for (const d of lists.domains) {
                 for (const p of lists.ports) {
                     for (const v of variants) {
-                        const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
-                        const trojanName = d.remark
-                            ? `T ${v.label} ${d.remark}`
-                            : `T ${v.label}  ${d.ip}:${p}`;
-                        allNodeUris.push(
-                            buildVlessUri(v.raw, userUUID, vlessName, lists.workerHost, d.ip, p),
-                        );
-                        allNodeUris.push(
-                            buildTrojanUri(
-                                v.raw,
-                                userUUID,
-                                trojanName,
-                                lists.workerHost,
-                                d.ip,
-                                p,
-                            ),
-                        );
+                        if (protocols.includes("vless")) {
+                            const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
+                            allNodeUris.push(
+                                buildVlessUri(v.raw, userUUID, vlessName, lists.workerHost, d.ip, p),
+                            );
+                        }
+                        if (protocols.includes("trojan")) {
+                            const trojanName = d.remark
+                                ? `T ${v.label} ${d.remark}`
+                                : `T ${v.label}  ${d.ip}:${p}`;
+                            allNodeUris.push(
+                                buildTrojanUri(
+                                    v.raw,
+                                    userUUID,
+                                    trojanName,
+                                    lists.workerHost,
+                                    d.ip,
+                                    p,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -1406,6 +1451,81 @@ export default {
 		  min-width: auto;
 		}
 		
+		.node-types-container {
+		  display: flex;
+		  flex-direction: column;
+		  gap: 10px;
+		  margin-top: 8px;
+		}
+		
+		.node-type-item {
+		  display: flex;
+		  align-items: center;
+		  gap: 12px;
+		  padding: 12px 16px;
+		  border: 2px solid var(--border-color);
+		  border-radius: 10px;
+		  background: #fff;
+		  cursor: pointer;
+		  transition: all .3s ease;
+		  user-select: none;
+		}
+		
+		.node-type-item:hover {
+		  border-color: var(--primary-light);
+		  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
+		}
+		
+		.node-type-item.selected {
+		  border-color: var(--primary);
+		  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+		  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.2);
+		}
+		
+		.node-type-item.disabled {
+		  opacity: 0.4;
+		  cursor: not-allowed;
+		}
+		
+		.node-type-item input[type="checkbox"] {
+		  width: 18px;
+		  height: 18px;
+		  accent-color: var(--primary);
+		  cursor: pointer;
+		  flex-shrink: 0;
+		}
+		
+		.node-type-item.disabled input[type="checkbox"] {
+		  cursor: not-allowed;
+		}
+		
+		.node-type-label {
+		  font-weight: 600;
+		  font-size: 14px;
+		  color: var(--text-primary);
+		  flex: 1;
+		}
+		
+		.node-type-desc {
+		  font-size: 12px;
+		  color: var(--text-secondary);
+		  margin-top: 2px;
+		}
+		
+		.node-type-badge {
+		  font-size: 11px;
+		  padding: 2px 8px;
+		  border-radius: 6px;
+		  background: #fee2e2;
+		  color: #991b1b;
+		  font-weight: 600;
+		}
+		
+		.node-type-item.selected .node-type-badge {
+		  background: #fef3c7;
+		  color: #92400e;
+		}
+		
 		.link-arrow {
 		  color: var(--primary);
 		  text-decoration: none;
@@ -1484,6 +1604,14 @@ export default {
 		.collapse-content.active {
 		  max-height: 2000px;
 		  padding: 20px;
+		}
+		
+		.collapse-content.scroll-area {
+		  overflow-y: auto;
+		}
+		
+		.collapse-content.scroll-area.active {
+		  max-height: 65vh;
 		}
 		
 		.qr-modal {
@@ -1691,7 +1819,7 @@ export default {
 					<span>⚙️配置管理</span>
 					<span class="icon">▼</span>
 				</button>
-				<div class="collapse-content" id="config-content">
+				<div class="collapse-content scroll-area" id="config-content">
 					<form id="configForm">
 						<div class="form-group">
 							<label for="uuid">UUID</label>
@@ -1746,6 +1874,69 @@ export default {
 							</div>
 							<div class="input-group">
 								<input type="text" id="proxyIp" name="proxyIp" placeholder="格式: host:port 或 host">
+							</div>
+						</div>
+						<div class="form-group">
+							<label>节点类型选择 <span style="color: #dc2626; font-size: 12px;">(至少选择一个)</span></label>
+							<div class="node-types-container" id="nodeTypesContainer">
+								<div class="node-type-item" data-type="direct" data-require="">
+									<input type="checkbox" class="node-type-checkbox" value="direct" checked>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟢 直连</div>
+										<div class="node-type-desc">直接连接非 Cloudflare CDN 站点</div>
+									</div>
+								</div>
+								<div class="node-type-item" data-type="s5" data-require="s5">
+									<input type="checkbox" class="node-type-checkbox" value="s5" disabled>
+									<div style="flex: 1;">
+										<div class="node-type-label">🔵 SOCKS5</div>
+										<div class="node-type-desc">仅使用SOCKS5代理连接目标</div>
+									</div>
+									<span class="node-type-badge" id="badge-s5">需填写SOCKS5</span>
+								</div>
+								<div class="node-type-item" data-type="direct_s5" data-require="s5">
+									<input type="checkbox" class="node-type-checkbox" value="direct_s5" disabled>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟡 直连 + SOCKS5</div>
+										<div class="node-type-desc">优先直连，失败后回退到SOCKS5代理</div>
+									</div>
+									<span class="node-type-badge" id="badge-direct_s5">需填写SOCKS5</span>
+								</div>
+								<div class="node-type-item" data-type="direct_proxy" data-require="proxyIp">
+									<input type="checkbox" class="node-type-checkbox" value="direct_proxy" disabled>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟣 直连 + ProxyIP</div>
+										<div class="node-type-desc">优先直连，失败后回退到ProxyIP中转</div>
+									</div>
+									<span class="node-type-badge" id="badge-direct_proxy">需填写ProxyIP</span>
+								</div>
+								<div class="node-type-item" data-type="direct_s5_proxy" data-require="s5_proxy">
+									<input type="checkbox" class="node-type-checkbox" value="direct_s5_proxy" disabled>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟤 直连 + SOCKS5 + ProxyIP</div>
+										<div class="node-type-desc">直连→SOCKS5→ProxyIP，多重回退</div>
+									</div>
+									<span class="node-type-badge" id="badge-direct_s5_proxy">需填写SOCKS5+ProxyIP</span>
+								</div>
+							</div>
+						</div>
+						<div class="form-group">
+							<label>协议类型选择 <span style="color: #dc2626; font-size: 12px;">(至少选择一个)</span></label>
+							<div class="node-types-container" id="protocolsContainer">
+								<div class="node-type-item" data-protocol="vless">
+									<input type="checkbox" class="protocol-checkbox" value="vless" checked>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟦 VLESS</div>
+										<div class="node-type-desc">Xray 原生协议，性能优秀，推荐使用</div>
+									</div>
+								</div>
+								<div class="node-type-item" data-protocol="trojan">
+									<input type="checkbox" class="protocol-checkbox" value="trojan" checked>
+									<div style="flex: 1;">
+										<div class="node-type-label">🟧 Trojan</div>
+										<div class="node-type-desc">简洁高效，伪装性强，兼容性好</div>
+									</div>
+								</div>
 							</div>
 						</div>
 						<div class="form-group">
@@ -1972,6 +2163,45 @@ export default {
 			
 			    const state = { domains: [], ports: [] };
 			
+			    function updateNodeTypeAvailability() {
+			        const s5Val = (document.getElementById('s5')?.value || '').trim();
+			        const proxyIpVal = (document.getElementById('proxyIp')?.value || '').trim();
+			        
+			        document.querySelectorAll('.node-type-item').forEach(item => {
+			            const require = item.getAttribute('data-require') || '';
+			            const checkbox = item.querySelector('.node-type-checkbox');
+			            if (!checkbox) return; // 跳过协议类型卡片
+			            let canUse = true;
+			            
+			            if (require === 's5' && !s5Val) canUse = false;
+			            if (require === 'proxyIp' && !proxyIpVal) canUse = false;
+			            if (require === 's5_proxy' && (!s5Val || !proxyIpVal)) canUse = false;
+			            
+			            if (canUse) {
+			                item.classList.remove('disabled');
+			                checkbox.disabled = false;
+			            } else {
+			                item.classList.add('disabled');
+			                checkbox.disabled = true;
+			                checkbox.checked = false;
+			                item.classList.remove('selected');
+			            }
+			        });
+			    }
+			    
+			    // 更新选中样式
+			    function updateNodeTypeSelectedStyle() {
+			        document.querySelectorAll('.node-type-item').forEach(item => {
+			            const checkbox = item.querySelector('.node-type-checkbox');
+			            if (!checkbox) return; // 跳过协议类型卡片
+			            if (checkbox.checked) {
+			                item.classList.add('selected');
+			            } else {
+			                item.classList.remove('selected');
+			            }
+			        });
+			    }
+			
 			    async function loadConfig() {
 			        try {
 			            const uuid = document.getElementById('uuid').value.trim() || '${userUUID}';
@@ -1985,6 +2215,39 @@ export default {
 			            document.getElementById('fallbackTimeout').value = cfg.fallbackTimeout || 100;
 			            document.getElementById('bestIpApi').value = cfg.bestIpApi || 'https://ipdb.api.030101.xyz/?type=bestcf';
 			            document.getElementById('autoUpdateBestIp').checked = !!cfg.autoUpdateBestIp;
+			            
+			            // 加载节点类型配置
+			            const savedNodeTypes = Array.isArray(cfg.nodeTypes) && cfg.nodeTypes.length > 0
+			                ? cfg.nodeTypes
+			                : ["direct"];
+			            updateNodeTypeAvailability();
+			            // 应用保存的勾选状态
+			            document.querySelectorAll('.node-type-checkbox').forEach(cb => {
+			                const item = cb.closest('.node-type-item');
+			                if (!item.classList.contains('disabled')) {
+			                    cb.checked = savedNodeTypes.includes(cb.value);
+			                    if (cb.checked) {
+			                        item.classList.add('selected');
+			                    }
+			                } else {
+			                    cb.checked = false;
+			                    item.classList.remove('selected');
+			                }
+			            });
+			            
+			            // 加载协议类型配置
+			            const savedProtocols = Array.isArray(cfg.protocols) && cfg.protocols.length > 0
+			                ? cfg.protocols
+			                : ["vless", "trojan"];
+			            document.querySelectorAll('.protocol-checkbox').forEach(cb => {
+			                const item = cb.closest('.node-type-item');
+			                cb.checked = savedProtocols.includes(cb.value);
+			                if (cb.checked) {
+			                    item.classList.add('selected');
+			                } else {
+			                    item.classList.remove('selected');
+			                }
+			            });
 			            
 			            if (Array.isArray(cfg.domains)) {
 			                state.domains = cfg.domains.map(item => {
@@ -2026,6 +2289,34 @@ export default {
 			        const bestIpApi = document.getElementById('bestIpApi').value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
 			        const autoUpdateBestIp = document.getElementById('autoUpdateBestIp').checked;
 			        
+			        // 收集选中的节点类型
+			        const nodeTypes = [];
+			        document.querySelectorAll('.node-type-checkbox').forEach(cb => {
+			            if (cb.checked && !cb.closest('.node-type-item').classList.contains('disabled')) {
+			                nodeTypes.push(cb.value);
+			            }
+			        });
+			        
+			        // 校验：至少选择一个类型
+			        if (nodeTypes.length === 0) {
+			            showMessage('❌ 请至少选择一个节点类型', 'error');
+			            return;
+			        }
+			        
+			        // 收集协议类型
+			        const protocols = [];
+			        document.querySelectorAll('.protocol-checkbox').forEach(cb => {
+			            if (cb.checked) {
+			                protocols.push(cb.value);
+			            }
+			        });
+			        
+			        // 校验：至少选择一个协议
+			        if (protocols.length === 0) {
+			            showMessage('❌ 请至少选择一个协议类型', 'error');
+			            return;
+			        }
+			        
 			        const domainItems = Array.from(document.querySelectorAll('#domains .list-item'));
 			        const domains = [];
 			        domainItems.forEach(row => {
@@ -2041,7 +2332,7 @@ export default {
 			            .map(i => parseInt(i.value, 10))
 			            .filter(n => n > 0 && n <= 65535);
 			        
-			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp };
+			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp, nodeTypes, protocols };
 			        
 			        const response = await fetch('/api/config/' + uuid, {
 			            method: 'POST',
@@ -2123,11 +2414,11 @@ export default {
 			            const uuid = document.getElementById('uuid').value.trim() || '${userUUID}';
 			            const bestIpApiInput = document.getElementById('bestIpApi');
 			            const apiUrl = bestIpApiInput.value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
-			            
+			
 			            const originalText = fetchBestIp.textContent;
 			            fetchBestIp.textContent = '⏳ 获取中...';
 			            fetchBestIp.disabled = true;
-			            
+			
 			            try {
 			                const response = await fetch('/api/fetch-best-ip/' + uuid, {
 			                    method: 'POST',
@@ -2135,7 +2426,7 @@ export default {
 			                    body: JSON.stringify({ apiUrl })
 			                });
 			                const result = await response.json();
-			                
+			
 			                if (result.success && result.ips && result.ips.length > 0) {
 			                    const existingIps = new Set(state.domains.map(d => d.ip));
 			                    let addedCount = 0;
@@ -2156,6 +2447,38 @@ export default {
 			                fetchBestIp.textContent = originalText;
 			                fetchBestIp.disabled = false;
 			            }
+			        });
+			        
+			        // 监听 SOCKS5 和 ProxyIP 输入变化，动态更新节点类型可用性
+			        const s5Input = document.getElementById('s5');
+			        const proxyIpInput = document.getElementById('proxyIp');
+			        s5Input && s5Input.addEventListener('input', () => {
+			            updateNodeTypeAvailability();
+			            // 如果因禁用被取消勾选，需要更新样式
+			            updateNodeTypeSelectedStyle();
+			        });
+			        proxyIpInput && proxyIpInput.addEventListener('input', () => {
+			            updateNodeTypeAvailability();
+			            updateNodeTypeSelectedStyle();
+			        });
+			        
+			        // 节点类型/协议类型勾选框点击事件
+			        document.querySelectorAll('.node-type-item').forEach(item => {
+			            item.addEventListener('click', (e) => {
+			                const checkbox = item.querySelector('input[type="checkbox"]');
+			                if (item.classList.contains('disabled') || !checkbox) {
+			                    e.preventDefault();
+			                    return;
+			                }
+			                if (e.target !== checkbox) {
+			                    checkbox.checked = !checkbox.checked;
+			                }
+			                if (checkbox.checked) {
+			                    item.classList.add('selected');
+			                } else {
+			                    item.classList.remove('selected');
+			                }
+			            });
 			        });
 			    });
 			
@@ -2189,6 +2512,8 @@ export default {
                         fallbackTimeout: 100,
                         bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
                         autoUpdateBestIp: false,
+                        nodeTypes: ["direct"],
+                    protocols: ["vless", "trojan"],
                     };
                     // 兼容旧格式：将字符串数组转换为对象数组
                     if (Array.isArray(merged.domains)) {
@@ -2208,6 +2533,12 @@ export default {
                             : 100;
                     merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
                     merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
+                    if (!Array.isArray(merged.nodeTypes) || merged.nodeTypes.length === 0) {
+                        merged.nodeTypes = ["direct"];
+                    }
+                    if (!Array.isArray(merged.protocols) || merged.protocols.length === 0) {
+                        merged.protocols = ["vless", "trojan"];
+                    }
                     return merged;
                 } catch {
                     return {
@@ -2221,6 +2552,8 @@ export default {
                         fallbackTimeout: 100,
                         bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
                         autoUpdateBestIp: false,
+                        nodeTypes: ["direct"],
+                    protocols: ["vless", "trojan"],
                     };
                 }
             };
@@ -2293,6 +2626,8 @@ export default {
                         fallbackTimeout: cfg.fallbackTimeout || 100,
                         bestIpApi: cfg.bestIpApi,
                         autoUpdateBestIp: cfg.autoUpdateBestIp,
+                        nodeTypes: cfg.nodeTypes && cfg.nodeTypes.length > 0 ? cfg.nodeTypes : ["direct"],
+                        protocols: cfg.protocols && cfg.protocols.length > 0 ? cfg.protocols : ["vless", "trojan"],
                     };
 
                     if (env.VTPanel) {
