@@ -79,6 +79,59 @@ const paramsMap={t:["m","type","mode"],d:["dir","direct","d"],s:["socks","proxy"
 const getPath=()=>paths[Math.floor(Math.random()*paths.length)];
 const getParam=(key)=>paramsMap[key][Math.floor(Math.random()*paramsMap[key].length)];
 
+// ----------- 共享常量和工具 -----------
+const DEFAULT_UUID = "ef9d104e-ca0e-4202-ba4b-a0afb969c747";
+const DEFAULT_BEST_IP_API = "https://ipdb.api.030101.xyz/?type=bestcf";
+const DEFAULT_CONFIG = {
+    uuid: DEFAULT_UUID, domain: "", port: "443", s5: "", proxyIp: "",
+    domains: [], ports: [443], fallbackTimeout: 100,
+    bestIpApi: DEFAULT_BEST_IP_API, autoUpdateBestIp: false,
+    nodeTypes: ["direct"], protocols: ["vless", "trojan"],
+};
+const SESSION_COOKIE_RE = /(?:^|;\s*)session=([^;]+)/;
+const SESSION_COOKIE = (uuid) => `session=${uuid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`;
+
+// 从 cookie 或 URL query 里取 session UUID，都没有返回 null
+function getSessionUUID(req, url) {
+    if (url) {
+        const p = url.searchParams.get("pwd") || url.searchParams.get("uuid");
+        if (p) return p;
+    }
+    const m = (req.headers.get("cookie") || "").match(SESSION_COOKIE_RE);
+    return m ? m[1] : null;
+}
+
+async function getUserConfig(env) {
+    const fallback = { ...DEFAULT_CONFIG };
+    try {
+        const cfg = await env.VTPanel?.get("user_config", "json");
+        const m = cfg || {};
+        // 兼容旧格式：字符串数组 → 对象数组
+        if (Array.isArray(m.domains)) {
+            m.domains = m.domains.map((x) =>
+                typeof x === "string" ? { ip: x, remark: "" } : x,
+            ).filter((x) => x && x.ip);
+        } else {
+            m.domains = [];
+        }
+        m.ports = Array.isArray(m.ports) ? m.ports : [];
+        m.fallbackTimeout =
+            typeof m.fallbackTimeout === "number"
+                ? Math.max(1, Math.min(5000, m.fallbackTimeout)) : 100;
+        m.bestIpApi = m.bestIpApi || DEFAULT_BEST_IP_API;
+        m.autoUpdateBestIp = !!m.autoUpdateBestIp;
+        if (!Array.isArray(m.nodeTypes) || !m.nodeTypes.length) m.nodeTypes = ["direct"];
+        if (!Array.isArray(m.protocols) || !m.protocols.length) m.protocols = ["vless", "trojan"];
+        const d = (m.domain || "").trim();
+        if (d && !m.domains.some((x) => x.ip === d)) m.domains.unshift({ ip: d, remark: "" });
+        const pn = Math.max(1, Math.min(65535, parseInt(m.port || "443", 10) || 443));
+        if (!m.ports.some((x) => +x === pn)) m.ports.push(pn);
+        return { ...fallback, ...m };
+    } catch {
+        return fallback;
+    }
+}
+
 function parseProxyAddress(proxyStr){
     if(!proxyStr) return null;
     proxyStr=proxyStr.trim();
@@ -165,74 +218,6 @@ const connectParallel=async(host,port,payload,order,mode,proxyCfg,proxyIp,getOrd
 
 export default {
     async fetch(req, env) {
-        const getUserConfig = async () => {
-            try {
-                const config = await env.VTPanel?.get("user_config", "json");
-                const merged = config || {
-                    uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
-                    domain: "",
-                    port: "443",
-                    s5: "",
-                    proxyIp: "",
-                    domains: [],
-                    ports: [],
-                    fallbackTimeout: 100,
-                    bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
-                    autoUpdateBestIp: false,
-                    nodeTypes: ["direct"],
-                    protocols: ["vless", "trojan"],
-                };
-                // 兼容旧格式：将字符串数组转换为对象数组
-                if (Array.isArray(merged.domains)) {
-                    merged.domains = merged.domains.map((item) => {
-                        if (typeof item === "string") {
-                            return { ip: item, remark: "" };
-                        }
-                        return item;
-                    });
-                } else {
-                    merged.domains = [];
-                }
-                merged.ports = Array.isArray(merged.ports) ? merged.ports : [];
-                merged.fallbackTimeout =
-                    typeof merged.fallbackTimeout === "number"
-                        ? Math.max(1, Math.min(5000, merged.fallbackTimeout))
-                        : 100;
-                merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
-                merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
-                // 兼容旧配置：补齐缺失的 nodeTypes 和 protocols
-                if (!Array.isArray(merged.nodeTypes) || merged.nodeTypes.length === 0) {
-                    merged.nodeTypes = ["direct"];
-                }
-                if (!Array.isArray(merged.protocols) || merged.protocols.length === 0) {
-                    merged.protocols = ["vless", "trojan"];
-                }
-                const d = (merged.domain || "").trim();
-                if (d && !merged.domains.some((x) => x.ip === d))
-                    merged.domains.unshift({ ip: d, remark: "" });
-                const pNum = Math.max(
-                    1,
-                    Math.min(65535, parseInt(merged.port || "443", 10) || 443),
-                );
-                if (!merged.ports.some((x) => +x === pNum)) merged.ports.push(pNum);
-                return merged;
-            } catch {
-                return {
-                    uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
-                    domain: "",
-                    port: "443",
-                    s5: "",
-                    proxyIp: "",
-                    domains: [],
-                    ports: [443],
-                    fallbackTimeout: 100,
-                    bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
-                    autoUpdateBestIp: false,
-                    nodeTypes: ["direct"],
-                    protocols: ["vless", "trojan"],
-                };
-            }
-        };
 
         const buildPath = (t, d, s, p) => {
             const params = [];
@@ -296,7 +281,7 @@ export default {
 
         if (req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
             const u = new URL(req.url);
-            const userConfig = await getUserConfig();
+            const userConfig = await getUserConfig(env);
             const [client, ws] = Object.values(new WebSocketPair());
             ws.accept();
             ws.binaryType = 'arraybuffer';
@@ -730,23 +715,19 @@ export default {
 
         const url = new URL(req.url);
 
-        if (url.pathname.startsWith("/api/fetch-best-ip/")) {
-            const pathParts = url.pathname.split("/").filter((p) => p);
-            const urlUUID = pathParts[2];
-            if (!urlUUID) return json({ error: "UUID不能为空" }, 400);
-            const userConfig = await getUserConfig();
-            if (urlUUID !== userConfig.uuid) return json({ error: "UUID错误，无权访问" }, 403);
-            
-            // 从请求体读取API地址，如果没有则用配置里的
-            let apiUrl = userConfig.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
+        if (url.pathname === "/api/fetch-best-ip") {
+            const userConfig = await getUserConfig(env);
+            let apiUrl = userConfig.bestIpApi || DEFAULT_BEST_IP_API;
+            let bodyUUID = null;
             try {
                 const body = await req.json();
-                if (body.apiUrl) {
-                    apiUrl = body.apiUrl;
-                }
-            } catch (e) {
-                // 请求体可能不存在，忽略
-            }
+                if (body.apiUrl) apiUrl = body.apiUrl;
+                bodyUUID = body.uuid || null;
+            } catch {}
+            // body.uuid 或 cookie session 任一有效即可
+            const validUUID = bodyUUID || getSessionUUID(req);
+            if (!validUUID) return json({ error: "请先登录" }, 401);
+            if (validUUID !== userConfig.uuid) return json({ error: "UUID错误，无权访问" }, 403);
             
             try {
                 const response = await fetch(apiUrl, {
@@ -773,20 +754,19 @@ export default {
             }
         }
 
-        if (url.pathname.startsWith("/api/config/")) {
-            const pathParts = url.pathname.split("/").filter((p) => p);
-            const urlUUID = pathParts[2];
-            if (!urlUUID) return json({ error: "UUID不能为空" }, 400);
-            const userConfig = await getUserConfig();
+        if (url.pathname === "/api/config") {
+            const userConfig = await getUserConfig(env);
             if (req.method === "GET") {
-                if (urlUUID !== userConfig.uuid) return json({ error: "UUID错误，无权访问" }, 403);
+                const inputUUID = getSessionUUID(req, url);
+                if (!inputUUID) return json({ error: "请先登录" }, 401);
+                if (inputUUID !== userConfig.uuid) return json({ error: "UUID错误，无权访问" }, 403);
                 return json(userConfig);
             } else if (req.method === "POST") {
                 try {
                     const incoming = await req.json();
                     if (!incoming.uuid || typeof incoming.uuid !== "string")
                         return json({ error: "UUID不能为空" }, 400);
-                    if (urlUUID !== userConfig.uuid && urlUUID !== incoming.uuid)
+                    if (incoming.uuid !== userConfig.uuid)
                         return json({ error: "UUID错误，无权访问" }, 403);
                     let domains = Array.isArray(incoming.domains)
                         ? incoming.domains
@@ -842,7 +822,7 @@ export default {
                         domains: domains,
                         ports: ports,
                         fallbackTimeout,
-                        bestIpApi: incoming.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf",
+                        bestIpApi: incoming.bestIpApi || DEFAULT_BEST_IP_API,
                         autoUpdateBestIp: !!incoming.autoUpdateBestIp,
                         nodeTypes: Array.isArray(incoming.nodeTypes) && incoming.nodeTypes.length > 0
                             ? incoming.nodeTypes
@@ -860,11 +840,10 @@ export default {
             }
         }
 
-        if (url.pathname.startsWith("/sub")) {
-            const parts = url.pathname.split("/").filter((p) => p);
-            const inputUUID = url.searchParams.get("uuid") || parts[1];
+        if (url.pathname === "/sub") {
+            const inputUUID = getSessionUUID(req, url);
             if (!inputUUID) return new Response("missing uuid", { status: 400 });
-            const userConfig = await getUserConfig();
+            const userConfig = await getUserConfig(env);
             if (inputUUID !== userConfig.uuid) return new Response("Not Found", { status: 404 });
             const { workerHost, domains, ports } = getDomainPortLists(req, userConfig);
             const variants = buildVariants(userConfig.s5, userConfig.proxyIp, userConfig.nodeTypes);
@@ -931,9 +910,8 @@ export default {
             const responseHeaders = {
                 "content-type": "text/plain; charset=utf-8",
                 "Profile-Update-Interval": "3",
-                "Profile-web-page-url": new URL(req.url).origin + "/" + userConfig.uuid,
+                "Profile-web-page-url": new URL(req.url).origin + "/",
                 "Cache-Control": "no-store",
-                "Content-Disposition": "attachment; filename=vtpanel",
             };
             if (订阅类型 === "mixed") {
                 return new Response(b64e(nodesContent) + "\n", {
@@ -976,6 +954,43 @@ export default {
         }
 
         if (url.pathname === "/" || url.pathname === "/index.html") {
+            const userConfig = await getUserConfig(env);
+            let pwd = url.searchParams.get("pwd");
+            let isLoggedIn = false;
+            let cookieSetHeader = null;
+            let errorMsg = "";
+
+            // 处理 POST 登录请求（支持浏览器保存密码）
+            if (req.method === "POST") {
+                try {
+                    const formData = await req.formData();
+                    pwd = formData.get("pwd");
+                } catch {}
+                if (pwd && pwd === userConfig.uuid) {
+                    return new Response(null, {
+                        status: 303,
+                        headers: {
+                            "Location": url.origin + url.pathname,
+                            "Set-Cookie": SESSION_COOKIE(pwd),
+                        },
+                    });
+                } else {
+                    errorMsg = "UUID错误，请检查后重新输入";
+                }
+            } else if (pwd) {
+                // GET 方式带 pwd 参数（兼容旧方式）
+                if (pwd === userConfig.uuid) {
+                    isLoggedIn = true;
+                    cookieSetHeader = SESSION_COOKIE(pwd);
+                } else {
+                    errorMsg = "UUID错误，请检查后重新输入";
+                }
+            } else {
+                const cookieUUID = getSessionUUID(req);
+                if (cookieUUID === userConfig.uuid) isLoggedIn = true;
+            }
+
+            if (!isLoggedIn) {
             const html = `
 <!doctype html>
 <html lang="zh-CN">
@@ -1037,7 +1052,7 @@ export default {
 		    font-weight: 600;
 		    color: var(--text-primary);
 		}
-		input[type="text"] {
+		input[type="text"], input[type="password"] {
 		    width: 100%;
 		    padding: 14px;
 		    border: 2px solid var(--border-color);
@@ -1048,7 +1063,7 @@ export default {
 		    box-sizing: border-box;
 		    transition: all .3s ease;
 		}
-		input[type="text"]:focus {
+		input[type="text"]:focus, input[type="password"]:focus {
 		    outline: none;
 		    border-color: var(--primary);
 		    box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
@@ -1086,48 +1101,24 @@ export default {
 <body>
 	<div class="card">
 		<h1>ZQ-VTPanel</h1>
-		<form method="get">
+		<form method="post" action="/">
 			<div class="form-group">
-				<label for="uuid">请输入UUID</label>
-				<input type="text" id="uuid" name="uuid" required placeholder="请输入正确的UUID">
+				<label for="pwd">请输入UUID</label>
+				<input type="password" id="pwd" name="pwd" required placeholder="请输入正确的UUID" autocomplete="current-password">
 			</div>
 			<button type="submit">进入节点界面</button>
 		</form>
-		<div class="error" id="error" style="display:none">UUID错误，请检查后重新输入</div>
+		${errorMsg ? `<div class="error">${errorMsg}</div>` : ''}
 	</div>
-	<script>
-		document.querySelector('form').addEventListener('submit', function(e) {
-		    e.preventDefault();
-		    const uuid = document.getElementById('uuid').value.trim();
-		    if (!uuid) return;
-		    fetch('/' + uuid).then(response => {
-		        if (response.ok) {
-		            window.location.href = '/' + uuid;
-		        } else {
-		            const errorDiv = document.getElementById('error');
-		            errorDiv.style.display = 'block';
-		            errorDiv.textContent = 'UUID错误，请检查后重新输入';
-		        }
-		    }).catch(() => {
-		        const errorDiv = document.getElementById('error');
-		        errorDiv.style.display = 'block';
-		        errorDiv.textContent = 'UUID错误，请检查后重新输入';
-		    });
-		});
-	</script>
 </body>
 </html>`;
-            return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
-        }
+                return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+            }
 
-        const pathParts = url.pathname.split("/").filter((p) => p);
-        if (pathParts.length === 1) {
-            const inputUUID = pathParts[0];
-            const userConfig = await getUserConfig();
-            if (inputUUID !== userConfig.uuid) return new Response("Not Found", { status: 404 });
+            // ---------- 已登录，渲染面板 ----------
             const userUUID = userConfig.uuid;
             const origin = new URL(req.url).origin;
-            const subUrl = `${origin}/sub/${userUUID}`;
+            const subUrl = `${origin}/sub?pwd=${userUUID}`;
             const lists = getDomainPortLists(req, userConfig);
             const variants = buildVariants(userConfig.s5, userConfig.proxyIp, userConfig.nodeTypes);
             const allNodeUris = [];
@@ -1834,7 +1825,7 @@ export default {
 							<div id="bestIpSettings" style="display: none; margin-bottom: 12px; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #bfdbfe;">
 								<div style="margin-bottom: 8px;">
 									<label style="font-size: 13px; font-weight: 600; color: #64748b;">优选IP API地址</label>
-									<input type="text" id="bestIpApi" placeholder="https://ipdb.api.030101.xyz/?type=bestcf" style="width: 100%; margin-top: 4px; padding: 8px 12px; border: 2px solid #bfdbfe; border-radius: 6px; font-size: 13px;">
+									<input type="text" id="bestIpApi" placeholder="${DEFAULT_BEST_IP_API}" style="width: 100%; margin-top: 4px; padding: 8px 12px; border: 2px solid #bfdbfe; border-radius: 6px; font-size: 13px;">
 								</div>
 								<div style="margin-bottom: 8px;">
 									<label style="display: flex; align-items: center; font-size: 13px; font-weight: 600; color: #64748b;">
@@ -1966,6 +1957,9 @@ export default {
 		<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 		<script>
 			(function() {
+			    // 登录成功后立刻把地址栏里的 ?pwd=... 清掉
+			    if (location.search) history.replaceState(null, '', location.pathname);
+
 			    const toastEl = document.getElementById('toast');
 			
 			    function showToast(msg) {
@@ -2204,8 +2198,7 @@ export default {
 			
 			    async function loadConfig() {
 			        try {
-			            const uuid = document.getElementById('uuid').value.trim() || '${userUUID}';
-			            const response = await fetch('/api/config/' + uuid);
+			            const response = await fetch('/api/config');
 			            if (!response.ok) throw 0;
 			            
 			            const cfg = await response.json();
@@ -2334,7 +2327,7 @@ export default {
 			        
 			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp, nodeTypes, protocols };
 			        
-			        const response = await fetch('/api/config/' + uuid, {
+			        const response = await fetch('/api/config', {
 			            method: 'POST',
 			            headers: { 'content-type': 'application/json' },
 			            body: JSON.stringify(body)
@@ -2345,7 +2338,7 @@ export default {
 			        if (response.ok) {
 			            showMessage('✅ ' + (result.message || '配置保存成功'), 'success');
 			            setTimeout(() => {
-			                window.location.href = '/' + uuid;
+			                window.location.href = '/';
 			            }, 800);
 			        } else {
 			            showMessage('❌ ' + (result.error || '配置保存失败'), 'error');
@@ -2420,10 +2413,10 @@ export default {
 			            fetchBestIp.disabled = true;
 			
 			            try {
-			                const response = await fetch('/api/fetch-best-ip/' + uuid, {
+			                const response = await fetch('/api/fetch-best-ip', {
 			                    method: 'POST',
 			                    headers: { 'Content-Type': 'application/json' },
-			                    body: JSON.stringify({ apiUrl })
+			                    body: JSON.stringify({ uuid, apiUrl })
 			                });
 			                const result = await response.json();
 			
@@ -2492,73 +2485,16 @@ export default {
 		</script>
 </body>
 </html>`;
-            return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+            const panelHeaders = { "content-type": "text/html; charset=utf-8" };
+            if (cookieSetHeader) panelHeaders["set-cookie"] = cookieSetHeader;
+            return new Response(html, { headers: panelHeaders });
         }
+        // 其他路径都返回 404
         return new Response("Not Found", { status: 404 });
     },
     async scheduled(event, env, ctx) {
         try {
-            const getUserConfig = async () => {
-                try {
-                    const config = await env.VTPanel?.get("user_config", "json");
-                    const merged = config || {
-                        uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
-                        domain: "",
-                        port: "443",
-                        s5: "",
-                        proxyIp: "",
-                        domains: [],
-                        ports: [],
-                        fallbackTimeout: 100,
-                        bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
-                        autoUpdateBestIp: false,
-                        nodeTypes: ["direct"],
-                    protocols: ["vless", "trojan"],
-                    };
-                    // 兼容旧格式：将字符串数组转换为对象数组
-                    if (Array.isArray(merged.domains)) {
-                        merged.domains = merged.domains.map((item) => {
-                            if (typeof item === "string") {
-                                return { ip: item, remark: "" };
-                            }
-                            return item;
-                        });
-                    } else {
-                        merged.domains = [];
-                    }
-                    merged.ports = Array.isArray(merged.ports) ? merged.ports : [];
-                    merged.fallbackTimeout =
-                        typeof merged.fallbackTimeout === "number"
-                            ? Math.max(1, Math.min(5000, merged.fallbackTimeout))
-                            : 100;
-                    merged.bestIpApi = merged.bestIpApi || "https://ipdb.api.030101.xyz/?type=bestcf";
-                    merged.autoUpdateBestIp = !!merged.autoUpdateBestIp;
-                    if (!Array.isArray(merged.nodeTypes) || merged.nodeTypes.length === 0) {
-                        merged.nodeTypes = ["direct"];
-                    }
-                    if (!Array.isArray(merged.protocols) || merged.protocols.length === 0) {
-                        merged.protocols = ["vless", "trojan"];
-                    }
-                    return merged;
-                } catch {
-                    return {
-                        uuid: "ef9d104e-ca0e-4202-ba4b-a0afb969c747",
-                        domain: "",
-                        port: "443",
-                        s5: "",
-                        proxyIp: "",
-                        domains: [],
-                        ports: [443],
-                        fallbackTimeout: 100,
-                        bestIpApi: "https://ipdb.api.030101.xyz/?type=bestcf",
-                        autoUpdateBestIp: false,
-                        nodeTypes: ["direct"],
-                    protocols: ["vless", "trojan"],
-                    };
-                }
-            };
-
-            const cfg = await getUserConfig();
+            const cfg = await getUserConfig(env);
             if (!cfg.autoUpdateBestIp || !cfg.bestIpApi) {
                 console.log("Auto update best IP is disabled or no API configured");
                 return;
