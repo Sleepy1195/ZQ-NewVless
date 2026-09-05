@@ -82,12 +82,181 @@ const getParam=(key)=>paramsMap[key][Math.floor(Math.random()*paramsMap[key].len
 // ----------- 共享常量和工具 -----------
 const DEFAULT_UUID = "ef9d104e-ca0e-4202-ba4b-a0afb969c747";
 const DEFAULT_BEST_IP_API = "https://ipdb.api.030101.xyz/?type=bestcf";
+const DEFAULT_ECH_SNI = "cloudflare-ech.com";
+const DEFAULT_ECH_DNS = "https://sm2.doh.pub/dns-query";
 const DEFAULT_CONFIG = {
     uuid: DEFAULT_UUID, domain: "", port: "443", s5: "", proxyIp: "",
     domains: [], ports: [443], fallbackTimeout: 100,
     bestIpApi: DEFAULT_BEST_IP_API, autoUpdateBestIp: false,
     nodeTypes: ["direct"], protocols: ["vless", "trojan"],
+    ech: false, echConfig: { sni: DEFAULT_ECH_SNI, dns: DEFAULT_ECH_DNS },
 };
+
+// 根据 userConfig 生成 ECH 链接参数；未启用时返回空串
+function buildEchParam(userConfig) {
+    if (!userConfig?.ech || !userConfig?.echConfig) return "";
+    const sni = userConfig.echConfig.sni || "";
+    const dns = userConfig.echConfig.dns || "";
+    const payload = (sni ? sni + "+" : "") + dns;
+    if (!payload) return "";
+    return `&ech=${encodeURIComponent(payload)}`;
+}
+
+// ---- ECH 订阅热补丁（让被墙域名也能通过 ECH 加密 SNI 翻墙）----
+// 思路：subapi 转换会丢失 ECH 信息，因此在返回前对 clash / singbox 内容做热补丁。
+//  - Clash: 给节点加 ech-opts，并在 dns 下加 nameserver-policy，将所有节点域名走 ECH DoH 解析
+//  - Singbox: 给匹配 UUID 的 outbound 加 tls.ech 配置
+
+const CLASH_BASE_DNS = `dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - 114.114.114.114
+  use-hosts: true
+  nameserver:
+    - https://sm2.doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - 8.8.4.4
+    - 208.67.220.220
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+      - 127.0.0.1/32
+      - 0.0.0.0/32
+    domain:
+      - '+.google.com'
+      - '+.facebook.com'
+      - '+.youtube.com'
+`;
+
+function clashEchHotPatch(clashYaml, { uuid, echSni, echDns, hosts }) {
+    if (!uuid) return clashYaml;
+    const echEnabled = Boolean(echSni || echDns);
+    const hostList = Array.isArray(hosts) ? [...hosts] : [];
+    if (echSni && !hostList.includes(echSni)) hostList.push(echSni);
+    let yaml = clashYaml.replace(/mode:\s*Rule\b/g, "mode: rule");
+
+    // 1. 确保存在 dns 块
+    if (!/^dns:\s*(?:\n|$)/m.test(yaml)) yaml = CLASH_BASE_DNS + yaml;
+
+    // 2. 插入 nameserver-policy，让所有节点域名走 ECH DoH 解析（绕过 DNS 污染）
+    if (echEnabled && hostList.length > 0 && echDns) {
+        const hostsEntries = hostList.map((h) => `    "${h}": ${echDns}`).join("\n");
+        if (/^\s{2}nameserver-policy:\s*(?:\n|$)/m.test(yaml)) {
+            yaml = yaml.replace(/^(\s{2}nameserver-policy:\s*\n)/m, `$1${hostsEntries}\n`);
+        } else {
+            const lines = yaml.split("\n");
+            let dnsEnd = -1;
+            let inDns = false;
+            for (let i = 0; i < lines.length; i++) {
+                if (/^dns:\s*$/.test(lines[i])) { inDns = true; continue; }
+                if (inDns && /^[a-zA-Z]/.test(lines[i])) { dnsEnd = i; break; }
+            }
+            const block = `  nameserver-policy:\n${hostsEntries}`;
+            if (dnsEnd !== -1) lines.splice(dnsEnd, 0, block);
+            else lines.push(block);
+            yaml = lines.join("\n");
+        }
+    }
+
+    if (!echEnabled) return yaml;
+
+    // 3. 遍历节点，给匹配 UUID 的节点加 ech-opts
+    const getProxyType = (t) => t.match(/type:\s*(\w+)/)?.[1] || "vless";
+    const getCredential = (t, isFlow) => {
+        const field = getProxyType(t) === "trojan" ? "password" : "uuid";
+        const re = new RegExp(`${field}:\\s*${isFlow ? "([^,}\\n]+)" : "([^\\n]+)"}`);
+        return t.match(re)?.[1]?.trim() || null;
+    };
+    const addBlockEchOpts = (nodeLines, topIndent) => {
+        let insertIdx = -1;
+        for (let j = nodeLines.length - 1; j >= 0; j--) {
+            if (nodeLines[j].trim()) { insertIdx = j; break; }
+        }
+        if (insertIdx < 0) return nodeLines;
+        const indent = " ".repeat(topIndent);
+        const lines = [`${indent}ech-opts:`, `${indent}  enable: true`];
+        if (echSni) lines.push(`${indent}  query-server-name: ${echSni}`);
+        nodeLines.splice(insertIdx + 1, 0, ...lines);
+        return nodeLines;
+    };
+
+    const lines = yaml.split("\n");
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (trimmed.startsWith("- {")) {
+            // 流式单行/多行节点
+            let full = line;
+            let brace = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+            while (brace > 0 && i + 1 < lines.length) {
+                i++;
+                full += "\n" + lines[i];
+                brace += (lines[i].match(/\{/g) || []).length - (lines[i].match(/\}/g) || []).length;
+            }
+            if (getCredential(full, true) === uuid.trim()) {
+                full = full.replace(/\}(\s*)$/, `, ech-opts: {enable: true${echSni ? `, query-server-name: ${echSni}` : ""}}}$1`);
+            }
+            out.push(full);
+            i++;
+        } else if (trimmed.startsWith("- name:")) {
+            // 块式节点
+            const nodeLines = [line];
+            const baseIndent = line.search(/\S/);
+            const topIndent = baseIndent + 2;
+            i++;
+            while (i < lines.length) {
+                const next = lines[i];
+                const nt = next.trim();
+                if (!nt) { nodeLines.push(next); i++; break; }
+                const ni = next.search(/\S/);
+                if (ni <= baseIndent && nt.startsWith("- ")) break;
+                if (ni < baseIndent && nt) break;
+                nodeLines.push(next);
+                i++;
+            }
+            const nodeText = nodeLines.join("\n");
+            if (getCredential(nodeText, false) === uuid.trim()) {
+                addBlockEchOpts(nodeLines, topIndent);
+            }
+            out.push(...nodeLines);
+        } else {
+            out.push(line);
+            i++;
+        }
+    }
+    return out.join("\n");
+}
+
+function singboxEchHotPatch(singboxText, { uuid, echSni }) {
+    if (!uuid) return singboxText;
+    const echEnabled = Boolean(echSni);
+    if (!echEnabled) return singboxText;
+    try {
+        const config = JSON.parse(singboxText.replace("1.1.1.1", "8.8.8.8").replace("1.0.0.1", "8.8.4.4"));
+        if (Array.isArray(config.outbounds)) {
+            config.outbounds.forEach((outbound) => {
+                if ((outbound.uuid && outbound.uuid === uuid) || (outbound.password && outbound.password === uuid)) {
+                    if (!outbound.tls) outbound.tls = { enabled: true };
+                    outbound.tls.ech = {
+                        enabled: true,
+                        query_server_name: echSni,
+                    };
+                }
+            });
+        }
+        return JSON.stringify(config, null, 2);
+    } catch (e) {
+        console.error("Singbox ECH 热补丁失败:", e);
+        return singboxText;
+    }
+}
 const SESSION_COOKIE_RE = /(?:^|;\s*)session=([^;]+)/;
 const SESSION_COOKIE = (uuid) => `session=${uuid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`;
 
@@ -122,6 +291,13 @@ async function getUserConfig(env) {
         m.autoUpdateBestIp = !!m.autoUpdateBestIp;
         if (!Array.isArray(m.nodeTypes) || !m.nodeTypes.length) m.nodeTypes = ["direct"];
         if (!Array.isArray(m.protocols) || !m.protocols.length) m.protocols = ["vless", "trojan"];
+        // ECH 字段归一化（兼容旧配置）
+        m.ech = !!m.ech;
+        if (!m.echConfig || typeof m.echConfig !== "object" || Array.isArray(m.echConfig)) m.echConfig = {};
+        let echSni = typeof m.echConfig.sni === "string" ? m.echConfig.sni.trim() : "";
+        let echDns = typeof m.echConfig.dns === "string" ? m.echConfig.dns.trim() : "";
+        m.echConfig.sni = echSni || DEFAULT_ECH_SNI;
+        m.echConfig.dns = echDns || DEFAULT_ECH_DNS;
         const d = (m.domain || "").trim();
         if (d && !m.domains.some((x) => x.ip === d)) m.domains.unshift({ ip: d, remark: "" });
         const pn = Math.max(1, Math.min(65535, parseInt(m.port || "443", 10) || 443));
@@ -229,10 +405,10 @@ export default {
             return `${getPath()}?${params.join("&")}`;
         };
 
-        const buildVlessUri = (rawPathQuery, uuid, label, workerHost, preferredDomain, port) =>
-            `vless://${uuid}@${preferredDomain}:${port}?encryption=none&security=tls&sni=${workerHost}&type=ws&host=${workerHost}&path=${encodeURIComponent(rawPathQuery)}&fp=chrome#${encodeURIComponent(label || preferredDomain)}`;
-        const buildTrojanUri = (rawPathQuery, uuid, label, workerHost, preferredDomain, port) =>
-            `trojan://${uuid}@${preferredDomain}:${port}?security=tls&sni=${workerHost}&type=ws&host=${workerHost}&path=${encodeURIComponent(rawPathQuery)}#${encodeURIComponent(label || preferredDomain)}`;
+        const buildVlessUri = (rawPathQuery, uuid, label, workerHost, preferredDomain, port, echParam = "") =>
+            `vless://${uuid}@${preferredDomain}:${port}?encryption=none&security=tls&sni=${workerHost}&type=ws${echParam}&host=${workerHost}&path=${encodeURIComponent(rawPathQuery)}&fp=chrome#${encodeURIComponent(label || preferredDomain)}`;
+        const buildTrojanUri = (rawPathQuery, uuid, label, workerHost, preferredDomain, port, echParam = "") =>
+            `trojan://${uuid}@${preferredDomain}:${port}?security=tls&sni=${workerHost}&type=ws${echParam}&host=${workerHost}&path=${encodeURIComponent(rawPathQuery)}#${encodeURIComponent(label || preferredDomain)}`;
 
         const buildVariants = (s5, proxyIp, nodeTypes) => {
             const v = [];
@@ -830,6 +1006,11 @@ export default {
                         protocols: Array.isArray(incoming.protocols) && incoming.protocols.length > 0
                             ? incoming.protocols
                             : ["vless", "trojan"],
+                        ech: !!incoming.ech,
+                        echConfig: {
+                            sni: (typeof incoming.echConfig?.sni === "string" ? incoming.echConfig.sni.trim() : "") || DEFAULT_ECH_SNI,
+                            dns: (typeof incoming.echConfig?.dns === "string" ? incoming.echConfig.dns.trim() : "") || DEFAULT_ECH_DNS,
+                        },
                     };
                     if (env.VTPanel)
                         await env.VTPanel.put("user_config", JSON.stringify(normalized));
@@ -879,13 +1060,22 @@ export default {
             const protocols = Array.isArray(userConfig.protocols) && userConfig.protocols.length > 0
                 ? userConfig.protocols
                 : ["vless", "trojan"];
+            const echParam = buildEchParam(userConfig);
+            // 收集所有节点使用的域名（排除纯 IP），用于 ECH nameserver-policy 走 DoH 解析
+            const isIP = (s) => /^(\d{1,3}\.){3}\d{1,3}$/.test(s) || /^[0-9a-fA-F:]+$/.test(s);
+            const echHosts = [...new Set(
+                [workerHost, ...domains.map((d) => d.ip)]
+                    .filter((h) => h && !isIP(h)),
+            )];
+            const echSni = userConfig.echConfig?.sni || "";
+            const echDns = userConfig.echConfig?.dns || "";
             for (const d of domains) {
                 for (const p of ports) {
                     for (const v of variants) {
                         if (protocols.includes("vless")) {
                             const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
                             out.push(
-                                buildVlessUri(v.raw, userConfig.uuid, vlessName, workerHost, d.ip, p),
+                                buildVlessUri(v.raw, userConfig.uuid, vlessName, workerHost, d.ip, p, echParam),
                             );
                         }
                         if (protocols.includes("trojan")) {
@@ -900,6 +1090,7 @@ export default {
                                     workerHost,
                                     d.ip,
                                     p,
+                                    echParam,
                                 ),
                             );
                         }
@@ -926,11 +1117,28 @@ export default {
                         headers: { "User-Agent": "Subconverter for " + 订阅类型, Accept: "*/*" },
                     });
                     if (response.ok) {
-                        const 转换后内容 = await response.text();
-                        if (订阅类型 === "clash")
+                        let 转换后内容 = await response.text();
+                        // ECH 热补丁：subapi 转换后 ECH 信息丢失，需在返回前补回
+                        if (userConfig.ech && 订阅类型 === "clash") {
+                            转换后内容 = clashEchHotPatch(转换后内容, {
+                                uuid: userConfig.uuid,
+                                echSni,
+                                echDns,
+                                hosts: echHosts,
+                            });
                             responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
-                        else if (订阅类型 === "singbox")
+                        } else if (userConfig.ech && 订阅类型 === "singbox") {
+                            转换后内容 = singboxEchHotPatch(转换后内容, {
+                                uuid: userConfig.uuid,
+                                echSni,
+                            });
                             responseHeaders["content-type"] = "application/json; charset=utf-8";
+                        } else {
+                            if (订阅类型 === "clash")
+                                responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
+                            else if (订阅类型 === "singbox")
+                                responseHeaders["content-type"] = "application/json; charset=utf-8";
+                        }
                         return new Response(转换后内容, { status: 200, headers: responseHeaders });
                     } else {
                         const errorText = await response.text().catch(() => "");
@@ -1125,13 +1333,14 @@ export default {
             const protocols = Array.isArray(userConfig.protocols) && userConfig.protocols.length > 0
                 ? userConfig.protocols
                 : ["vless", "trojan"];
+            const echParam = buildEchParam(userConfig);
             for (const d of lists.domains) {
                 for (const p of lists.ports) {
                     for (const v of variants) {
                         if (protocols.includes("vless")) {
                             const vlessName = d.remark ? `V ${v.label} ${d.remark}` : `V ${v.label} ${d.ip}:${p}`;
                             allNodeUris.push(
-                                buildVlessUri(v.raw, userUUID, vlessName, lists.workerHost, d.ip, p),
+                                buildVlessUri(v.raw, userUUID, vlessName, lists.workerHost, d.ip, p, echParam),
                             );
                         }
                         if (protocols.includes("trojan")) {
@@ -1146,6 +1355,7 @@ export default {
                                     lists.workerHost,
                                     d.ip,
                                     p,
+                                    echParam,
                                 ),
                             );
                         }
@@ -1868,6 +2078,26 @@ export default {
 							</div>
 						</div>
 						<div class="form-group">
+							<div class="label-with-link">
+								<label for="echEnabled">Encrypted Client Hello(ECH)</label>
+								<button type="button" id="toggleEchSettings" style="margin-left: 8px; padding: 6px 12px; min-width: auto; flex: none; background: #DAE9FE; color: #2563eb; border-radius: 10px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .3s ease; display: inline-flex; align-items: center; justify-content: center;">高级</button>
+							</div>
+							<label style="display: flex; align-items: center; font-size: 14px; font-weight: 600; color: #64748b; margin-top: 8px;">
+								<input type="checkbox" id="echEnabled" name="echEnabled" style="margin-right: 8px;">
+								启用 ECH 
+							</label>
+							<div id="echSettings" style="display: none; margin-top: 12px; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid #bfdbfe;">
+								<div style="margin-bottom: 8px;">
+									<label style="font-size: 13px; font-weight: 600; color: #64748b;">ECH 解析域名 (SNI)</label>
+									<input type="text" id="echSni" placeholder="${DEFAULT_ECH_SNI}" style="width: 100%; margin-top: 4px; padding: 8px 12px; border: 2px solid #bfdbfe; border-radius: 6px; font-size: 13px;">
+								</div>
+								<div style="margin-bottom: 8px;">
+									<label style="font-size: 13px; font-weight: 600; color: #64748b;">ECH DNS 服务 (DoH)</label>
+									<input type="text" id="echDns" placeholder="${DEFAULT_ECH_DNS}" style="width: 100%; margin-top: 4px; padding: 8px 12px; border: 2px solid #bfdbfe; border-radius: 6px; font-size: 13px;">
+								</div>
+							</div>
+						</div>
+						<div class="form-group">
 							<label>节点类型选择 <span style="color: #dc2626; font-size: 12px;">(至少选择一个)</span></label>
 							<div class="node-types-container" id="nodeTypesContainer">
 								<div class="node-type-item" data-type="direct" data-require="">
@@ -2203,10 +2433,15 @@ export default {
 			            
 			            const cfg = await response.json();
 			            document.getElementById('uuid').value = cfg.uuid || '';
-			            document.getElementById('s5').value = cfg.s5 || '';
-			            document.getElementById('proxyIp').value = cfg.proxyIp || '';
-			            document.getElementById('fallbackTimeout').value = cfg.fallbackTimeout || 100;
-			            document.getElementById('bestIpApi').value = cfg.bestIpApi || 'https://ipdb.api.030101.xyz/?type=bestcf';
+                            document.getElementById('s5').value = cfg.s5 || '';
+                            document.getElementById('proxyIp').value = cfg.proxyIp || '';
+                            document.getElementById('fallbackTimeout').value = cfg.fallbackTimeout || 100;
+                            document.getElementById('bestIpApi').value = cfg.bestIpApi || 'https://ipdb.api.030101.xyz/?type=bestcf';
+                            // ECH 配置加载
+                            document.getElementById('echEnabled').checked = !!cfg.ech;
+                            const echCfg = cfg.echConfig && typeof cfg.echConfig === 'object' ? cfg.echConfig : {};
+                            document.getElementById('echSni').value = echCfg.sni || '';
+                            document.getElementById('echDns').value = echCfg.dns || '';
 			            document.getElementById('autoUpdateBestIp').checked = !!cfg.autoUpdateBestIp;
 			            
 			            // 加载节点类型配置
@@ -2276,11 +2511,16 @@ export default {
 			
 			    async function saveConfigForm() {
 			        const uuid = document.getElementById('uuid').value.trim();
-			        const s5 = document.getElementById('s5').value.trim();
-			        const proxyIp = document.getElementById('proxyIp').value.trim();
-			        const fallbackTimeout = parseInt(document.getElementById('fallbackTimeout').value, 10) || 100;
-			        const bestIpApi = document.getElementById('bestIpApi').value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
-			        const autoUpdateBestIp = document.getElementById('autoUpdateBestIp').checked;
+                        const s5 = document.getElementById('s5').value.trim();
+                        const proxyIp = document.getElementById('proxyIp').value.trim();
+                        const fallbackTimeout = parseInt(document.getElementById('fallbackTimeout').value, 10) || 100;
+                        const bestIpApi = document.getElementById('bestIpApi').value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
+                        const autoUpdateBestIp = document.getElementById('autoUpdateBestIp').checked;
+                        // ECH 配置收集
+                        const ech = document.getElementById('echEnabled').checked;
+                        const echSni = document.getElementById('echSni').value.trim();
+                        const echDns = document.getElementById('echDns').value.trim();
+                        const echConfig = { sni: echSni, dns: echDns };
 			        
 			        // 收集选中的节点类型
 			        const nodeTypes = [];
@@ -2325,7 +2565,7 @@ export default {
 			            .map(i => parseInt(i.value, 10))
 			            .filter(n => n > 0 && n <= 65535);
 			        
-			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp, nodeTypes, protocols };
+			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp, nodeTypes, protocols, ech, echConfig };
 			        
 			        const response = await fetch('/api/config', {
 			            method: 'POST',
@@ -2396,12 +2636,22 @@ export default {
 			        
 			        toggleBestIpSettings && toggleBestIpSettings.addEventListener('click', () => {
 			            const settings = document.getElementById('bestIpSettings');
-			            if (settings.style.display === 'none') {
-			                settings.style.display = 'block';
-			            } else {
-			                settings.style.display = 'none';
-			            }
-			        });
+				            if (settings.style.display === 'none') {
+				                settings.style.display = 'block';
+				            } else {
+				                settings.style.display = 'none';
+				            }
+				        });
+
+				        const toggleEchSettings = document.getElementById('toggleEchSettings');
+				        toggleEchSettings && toggleEchSettings.addEventListener('click', () => {
+				            const echSettings = document.getElementById('echSettings');
+				            if (echSettings.style.display === 'none') {
+				                echSettings.style.display = 'block';
+				            } else {
+				                echSettings.style.display = 'none';
+				            }
+				        });
 			        
 			        fetchBestIp && fetchBestIp.addEventListener('click', async () => {
 			            const uuid = document.getElementById('uuid').value.trim() || '${userUUID}';
@@ -2564,6 +2814,11 @@ export default {
                         autoUpdateBestIp: cfg.autoUpdateBestIp,
                         nodeTypes: cfg.nodeTypes && cfg.nodeTypes.length > 0 ? cfg.nodeTypes : ["direct"],
                         protocols: cfg.protocols && cfg.protocols.length > 0 ? cfg.protocols : ["vless", "trojan"],
+                        ech: !!cfg.ech,
+                        echConfig: {
+                            sni: cfg.echConfig?.sni || DEFAULT_ECH_SNI,
+                            dns: cfg.echConfig?.dns || DEFAULT_ECH_DNS,
+                        },
                     };
 
                     if (env.VTPanel) {
