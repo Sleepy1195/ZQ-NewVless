@@ -66,7 +66,7 @@
    - **端口**：可选，默认443(可填443系端口:443、2053、2083、2087、2096、8443)
    - **SOCKS5代理**：可选，格式 `user:pass@host:port` 或者 `host:port`
    - **ProxyIP**：可选，格式 `host:port` 或者 `host`
-   - **订阅转换服务**：可选，填你自建的 Sublink Worker 根地址（如 `https://sublink.example.com`），只填根地址、不要带 `?` 参数，留空用内置默认值
+   - **订阅转换服务**：可选，填你自建的 Sublink Worker 根地址（如 `https://sublink.example.com`）
    - **回退检测时间**：可选，默认200毫秒，当连接无响应时等待的时间，单位毫秒，范围1-5000
 4. **节点类型选择**（至少选一个）：
    - **直连**：直接使用 Cloudflare Workers IP，始终可选
@@ -93,31 +93,6 @@
    - 启用后，订阅会自动注入 ECH 参数，让被 DNS 污染的节点域名也能正常连接
 8. 点击"💾保存配置"，订阅内容会根据你的选择实时刷新
 
-## 🔀 订阅转换说明
-
-面板里「订阅链接」给的是同一个通用链接（`/sub?pwd=你的UUID`）。客户端来拉订阅时，Worker 会先判断它是哪个客户端，再把节点列表交给订阅转换服务（Sublink Worker）转成对应格式：
-
-| 客户端 | 识别方式 | 返回内容 |
-|---------|---------|---------|
-| Clash / mihomo | UA 含 `clash` / `meta` / `mihomo`，或链接带 `?target=clash` | Clash YAML（含策略组与规则） |
-| Sing-Box | UA 含 `sing-box` / `singbox`，或链接带 `?sb=1`、`?target=singbox` | Sing-Box JSON（按 UA 版本自动选 1.11 / 1.12 / 1.14 档位） |
-| Surge | UA 含 `surge`，或链接带 `?surge=1`、`?target=surge` | Surge 配置 |
-| 其他（Quantumult X、Loon、subconverter 等） | — | 直接返回 Base64 节点列表，不会报错 |
-
-> 💡 请求会把客户端的真实 `User-Agent` 透传给转换服务 —— Sing-Box 的配置档位就是靠它判断的，所以不要手动伪造 UA。
-
-### 换用自己的转换服务
-
-默认使用内置的公共 Sublink 服务，可以换成你自己部署的：
-
-1. **面板里改（推荐）**：配置管理 → **订阅转换服务** → 填服务根地址，例如 `https://sublink.example.com` → 保存
-2. **部署级默认值**：在 Cloudflare 控制台给 Worker 加环境变量 `SUBLINK_BASE`，适合还没在面板里保存过配置的情况
-
-优先级：**面板配置 > 环境变量 `SUBLINK_BASE` > 内置默认值**。环境变量只作兜底，面板里保存过一次之后就完全以面板的值为准。
-
-> ⚠️ 只能填**服务根地址**。如果填成完整订阅链接（带 `?target=`、`&url=` 或 `#`），保存时会直接提示格式错误，不会静默存进去。
-
-> 💡 服务需为 [Sublink Worker](https://sublink.works) 部署，接口为 `/clash`、`/singbox`、`/surge`，参数名是 `config`（不是 subconverter 的 `/sub?target=&url=`）。用 subconverter 部署的服务不兼容。
 
 ## 🔗 连接方式说明
 
