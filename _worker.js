@@ -84,9 +84,23 @@ const DEFAULT_UUID = "ef9d104e-ca0e-4202-ba4b-a0afb969c747";
 const DEFAULT_BEST_IP_API = "https://ipdb.api.030101.xyz/?type=bestcf";
 const DEFAULT_ECH_SNI = "cloudflare-ech.com";
 const DEFAULT_ECH_DNS = "https://sm2.doh.pub/dns-query";
+// 订阅转换服务（Sublink Worker）。可用环境变量 SUBLINK_BASE 覆盖，换成你自己部署的 Sublink。
+const DEFAULT_SUBLINK_BASE = "https://sublink.vpnjacky.dpdns.org";
+// Sublink 原生 API 是 /clash /singbox /surge /xray?config=...，
+// 并没有 subconverter 那种 /sub?target=... 接口，所以这里只做「目标 -> 端点」白名单映射。
+const SUBLINK_TARGET_ENDPOINTS = { clash: "clash", singbox: "singbox", surge: "surge" };
+// 订阅转换服务地址归一化：只接受 http(s):// 的服务根地址，去掉尾部斜杠。
+// 带 ? 或 # 说明用户贴的是完整订阅/转换链接而不是服务地址，一律判为非法并返回 ""（由调用方回退默认值）
+function normalizeSubLinkBase(v) {
+    if (typeof v !== "string") return "";
+    const s = v.trim().replace(/\/+$/, "");
+    if (/[?#]/.test(s)) return "";
+    return /^https?:\/\/[^\s/]+/i.test(s) ? s : "";
+}
 const DEFAULT_CONFIG = {
     uuid: DEFAULT_UUID, domain: "", port: "443", s5: "", proxyIp: "",
     domains: [], ports: [443], fallbackTimeout: 100,
+    subLinkBase: DEFAULT_SUBLINK_BASE,
     bestIpApi: DEFAULT_BEST_IP_API, autoUpdateBestIp: false,
     nodeTypes: ["direct"], protocols: ["vless", "trojan"],
     ech: false, echConfig: { sni: DEFAULT_ECH_SNI, dns: DEFAULT_ECH_DNS },
@@ -272,6 +286,10 @@ function getSessionUUID(req, url) {
 
 async function getUserConfig(env) {
     const fallback = { ...DEFAULT_CONFIG };
+    // SUBLINK_BASE 环境变量作为「部署级默认值」：存储里没有 subLinkBase 时（老配置）生效。
+    // 面板上保存过一次之后就以北面板里的值为准。
+    const envBase = normalizeSubLinkBase(env?.SUBLINK_BASE);
+    if (envBase) fallback.subLinkBase = envBase;
     try {
         const cfg = await env.VTPanel?.get("user_config", "json");
         const m = cfg || {};
@@ -288,6 +306,7 @@ async function getUserConfig(env) {
             typeof m.fallbackTimeout === "number"
                 ? Math.max(1, Math.min(5000, m.fallbackTimeout)) : 100;
         m.bestIpApi = m.bestIpApi || DEFAULT_BEST_IP_API;
+        m.subLinkBase = normalizeSubLinkBase(m.subLinkBase) || fallback.subLinkBase;
         m.autoUpdateBestIp = !!m.autoUpdateBestIp;
         if (!Array.isArray(m.nodeTypes) || !m.nodeTypes.length) m.nodeTypes = ["direct"];
         if (!Array.isArray(m.protocols) || !m.protocols.length) m.protocols = ["vless", "trojan"];
@@ -944,6 +963,10 @@ export default {
                         return json({ error: "UUID不能为空" }, 400);
                     if (incoming.uuid !== userConfig.uuid)
                         return json({ error: "UUID错误，无权访问" }, 403);
+                    if (typeof incoming.subLinkBase === "string" &&
+                        incoming.subLinkBase.trim() &&
+                        !normalizeSubLinkBase(incoming.subLinkBase))
+                        return json({ error: "订阅转换服务地址格式不正确，需是 http(s):// 开头的服务地址（不要带 ? 参数）" }, 400);
                     let domains = Array.isArray(incoming.domains)
                         ? incoming.domains
                               .map((x) => {
@@ -998,6 +1021,7 @@ export default {
                         domains: domains,
                         ports: ports,
                         fallbackTimeout,
+                        subLinkBase: normalizeSubLinkBase(incoming.subLinkBase) || DEFAULT_SUBLINK_BASE,
                         bestIpApi: incoming.bestIpApi || DEFAULT_BEST_IP_API,
                         autoUpdateBestIp: !!incoming.autoUpdateBestIp,
                         nodeTypes: Array.isArray(incoming.nodeTypes) && incoming.nodeTypes.length > 0
@@ -1104,60 +1128,71 @@ export default {
                 "Profile-web-page-url": new URL(req.url).origin + "/",
                 "Cache-Control": "no-store",
             };
-            if (订阅类型 === "mixed") {
-                return new Response(b64e(nodesContent) + "\n", {
+            const encodedNodes = b64e(nodesContent);
+            // "surge&ver=4" 这类带参数的 target 先按 & 截断再取端点
+            const 端点名 = String(订阅类型).split("&")[0].trim().toLowerCase();
+            const endpoint = SUBLINK_TARGET_ENDPOINTS[端点名];
+            // mixed，以及 Sublink 不支持的格式（quanx / loon 等）：直接返回通用 base64 节点列表
+            if (!endpoint) {
+                return new Response(encodedNodes + "\n", {
                     status: 200,
                     headers: responseHeaders,
                 });
-            } else {
-                const encodedNodes = b64e(nodesContent);
-                const 订阅转换URL = `https://subapi.vpnjacky.dpdns.org/sub?target=${订阅类型}&url=${encodeURIComponent(encodedNodes)}&emoji=false&insert=false`;
-                try {
-                    const response = await fetch(订阅转换URL, {
-                        headers: { "User-Agent": "Subconverter for " + 订阅类型, Accept: "*/*" },
-                    });
-                    if (response.ok) {
-                        let 转换后内容 = await response.text();
-                        // ECH 热补丁：subapi 转换后 ECH 信息丢失，需在返回前补回
-                        if (userConfig.ech && 订阅类型 === "clash") {
-                            转换后内容 = clashEchHotPatch(转换后内容, {
-                                uuid: userConfig.uuid,
-                                echSni,
-                                echDns,
-                                hosts: echHosts,
-                            });
-                            responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
-                        } else if (userConfig.ech && 订阅类型 === "singbox") {
-                            转换后内容 = singboxEchHotPatch(转换后内容, {
-                                uuid: userConfig.uuid,
-                                echSni,
-                            });
-                            responseHeaders["content-type"] = "application/json; charset=utf-8";
-                        } else {
-                            if (订阅类型 === "clash")
-                                responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
-                            else if (订阅类型 === "singbox")
-                                responseHeaders["content-type"] = "application/json; charset=utf-8";
-                        }
-                        return new Response(转换后内容, { status: 200, headers: responseHeaders });
+            }
+            // 转换服务地址已在 getUserConfig 里归一化（面板配置 > 环境变量 SUBLINK_BASE > 内置默认值）
+            const sublinkBase = normalizeSubLinkBase(userConfig.subLinkBase) || DEFAULT_SUBLINK_BASE;
+            const 订阅转换URL = `${sublinkBase}/${endpoint}?config=${encodeURIComponent(encodedNodes)}`;
+            // 透传客户端 UA：Sublink 会据此选择 sing-box 配置档位（1.11 / 1.12 / 1.14），
+            // 用固定的假 UA 会让老版本 sing-box 拿到不兼容的配置。
+            const clientUA = req.headers.get("User-Agent") || "";
+            const convertUA = /^[\x20-\x7e]{1,200}$/.test(clientUA) ? clientUA : `Sublink/${endpoint}`;
+            try {
+                const response = await fetch(订阅转换URL, {
+                    headers: { "User-Agent": convertUA, Accept: "*/*" },
+                });
+                if (response.ok) {
+                    let 转换后内容 = await response.text();
+                    // ECH 热补丁：订阅转换后 ECH 信息丢失，需在返回前补回
+                    if (userConfig.ech && endpoint === "clash") {
+                        转换后内容 = clashEchHotPatch(转换后内容, {
+                            uuid: userConfig.uuid,
+                            echSni,
+                            echDns,
+                            hosts: echHosts,
+                        });
+                        responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
+                    } else if (userConfig.ech && endpoint === "singbox") {
+                        转换后内容 = singboxEchHotPatch(转换后内容, {
+                            uuid: userConfig.uuid,
+                            echSni,
+                        });
+                        responseHeaders["content-type"] = "application/json; charset=utf-8";
                     } else {
-                        const errorText = await response.text().catch(() => "");
-                        return text(
-                            "订阅转换失败: " +
-                                response.statusText +
-                                "\n" +
-                                errorText +
-                                "\nURL: " +
-                                订阅转换URL,
-                            500,
-                        );
+                        if (endpoint === "clash")
+                            responseHeaders["content-type"] = "application/x-yaml; charset=utf-8";
+                        else if (endpoint === "singbox")
+                            responseHeaders["content-type"] = "application/json; charset=utf-8";
                     }
-                } catch {
-                    return new Response(b64e(nodesContent) + "\n", {
-                        status: 200,
-                        headers: responseHeaders,
-                    });
+                    return new Response(转换后内容, { status: 200, headers: responseHeaders });
+                } else {
+                    const errorText = await response.text().catch(() => "");
+                    return text(
+                        "订阅转换失败: " +
+                            response.status +
+                            " " +
+                            response.statusText +
+                            "\n" +
+                            errorText +
+                            "\nURL: " +
+                            订阅转换URL,
+                        500,
+                    );
                 }
+            } catch {
+                return new Response(encodedNodes + "\n", {
+                    status: 200,
+                    headers: responseHeaders,
+                });
             }
         }
 
@@ -2079,6 +2114,14 @@ export default {
 						</div>
 						<div class="form-group">
 							<div class="label-with-link">
+								<label for="subLinkBase">订阅转换服务(可选)</label>
+							</div>
+							<div class="input-group">
+								<input type="text" id="subLinkBase" name="subLinkBase" placeholder="${DEFAULT_SUBLINK_BASE}">
+							</div>
+						</div>
+						<div class="form-group">
+							<div class="label-with-link">
 								<label for="echEnabled">Encrypted Client Hello(ECH)</label>
 								<button type="button" id="toggleEchSettings" style="margin-left: 8px; padding: 6px 12px; min-width: auto; flex: none; background: #DAE9FE; color: #2563eb; border-radius: 10px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all .3s ease; display: inline-flex; align-items: center; justify-content: center;">高级</button>
 							</div>
@@ -2437,6 +2480,7 @@ export default {
                             document.getElementById('proxyIp').value = cfg.proxyIp || '';
                             document.getElementById('fallbackTimeout').value = cfg.fallbackTimeout || 100;
                             document.getElementById('bestIpApi').value = cfg.bestIpApi || 'https://ipdb.api.030101.xyz/?type=bestcf';
+                            document.getElementById('subLinkBase').value = cfg.subLinkBase || '${DEFAULT_SUBLINK_BASE}';
                             // ECH 配置加载
                             document.getElementById('echEnabled').checked = !!cfg.ech;
                             const echCfg = cfg.echConfig && typeof cfg.echConfig === 'object' ? cfg.echConfig : {};
@@ -2515,6 +2559,16 @@ export default {
                         const proxyIp = document.getElementById('proxyIp').value.trim();
                         const fallbackTimeout = parseInt(document.getElementById('fallbackTimeout').value, 10) || 100;
                         const bestIpApi = document.getElementById('bestIpApi').value.trim() || 'https://ipdb.api.030101.xyz/?type=bestcf';
+                        const subLinkBase = document.getElementById('subLinkBase').value.trim();
+                        // 注意：面板 HTML 是模板字符串，这里刻意不用正则，避免反斜杠被模板转义吃掉
+                        if (subLinkBase && !(subLinkBase.startsWith('http://') || subLinkBase.startsWith('https://'))) {
+                            showMessage('❌ 订阅转换服务地址需以 http:// 或 https:// 开头', 'error');
+                            return;
+                        }
+                        if (subLinkBase && (subLinkBase.indexOf('?') !== -1 || subLinkBase.indexOf('#') !== -1)) {
+                            showMessage('❌ 订阅转换服务地址只填服务根地址，不要带 ? 参数', 'error');
+                            return;
+                        }
                         const autoUpdateBestIp = document.getElementById('autoUpdateBestIp').checked;
                         // ECH 配置收集
                         const ech = document.getElementById('echEnabled').checked;
@@ -2565,7 +2619,7 @@ export default {
 			            .map(i => parseInt(i.value, 10))
 			            .filter(n => n > 0 && n <= 65535);
 			        
-			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, bestIpApi, autoUpdateBestIp, nodeTypes, protocols, ech, echConfig };
+			        const body = { uuid, s5, proxyIp, domains, ports, fallbackTimeout, subLinkBase, bestIpApi, autoUpdateBestIp, nodeTypes, protocols, ech, echConfig };
 			        
 			        const response = await fetch('/api/config', {
 			            method: 'POST',
@@ -2810,6 +2864,8 @@ export default {
                         domains: domains,
                         ports: cfg.ports || [443],
                         fallbackTimeout: cfg.fallbackTimeout || 100,
+                        // 注意：这里会整份回写配置，前端新增的字段必须一并带上，否则会被定时任务抹掉
+                        subLinkBase: normalizeSubLinkBase(cfg.subLinkBase) || DEFAULT_SUBLINK_BASE,
                         bestIpApi: cfg.bestIpApi,
                         autoUpdateBestIp: cfg.autoUpdateBestIp,
                         nodeTypes: cfg.nodeTypes && cfg.nodeTypes.length > 0 ? cfg.nodeTypes : ["direct"],
