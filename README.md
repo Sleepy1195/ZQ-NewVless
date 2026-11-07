@@ -1,8 +1,8 @@
-# ZQ-VTPanel
+# ZQ-JKPanel
 
 ![界面](src/界面.png)
 
-一个跑在 Cloudflare Workers 上的 VLESS / Trojan 节点面板，一份代码同时是节点隧道、订阅分发器和 Web 管理后台。
+一个跑在 Cloudflare Workers 上的 VLESS / Trojan 节点面板，一份 `_worker.js` 同时是节点隧道、订阅分发器和 Web 管理后台。
 
 ## 功能
 
@@ -11,12 +11,11 @@
 - 其它代理支持 socks5 / http / https / sstp / turn
 - 全局开关：只走代理，或直连失败回退
 - VLESS / Trojan 独立或同时出订阅，自动识别 Clash / Sing-Box / Surge 并调用 subconverter 转换
-- ECH 加密、回退检测时间、优选IP 与其它代理自动拉取
+- 传输类型 WebSocket / XHTTP / gRPC，可多选，同时出多套节点
+- ECH 加密、优选IP 与其它代理自动拉取
 - 密码登录鉴权，路径与参数伪装混淆
 
 ## 部署步骤
-
-### 1. 部署到 Workers
 
 1. 登录 Cloudflare 控制台
 2. 左侧进入 **Workers 和 Pages**
@@ -29,26 +28,14 @@
 6. 点击右上角 **保存并部署**
 7. 创建 KV 命名空间：
    - 左侧进入 **存储和数据库**，点击 **KV**
-   - 点击 **创建命名空间**，名称建议：`VTPanel`
+   - 点击 **创建命名空间**，名称建议：`JKPanel`
 8. 在 Worker 详情页绑定 KV：
    - 打开 Worker → **设置** → **变量** → **KV 命名空间绑定** → **添加绑定**
-   - 变量名称：`VTPanel`
+   - 变量名称：`JKPanel`
    - 选择刚创建的 KV 命名空间
    - 点击 **保存**
 9. 绑定自定义域名（注意：不能使用 workers 默认域名）
-
-### 2. 部署到 Pages
-
-1. [下载 ZIP](https://github.com/bayueqi/ZQ-VTPanel/archive/refs/heads/main.zip)
-2. 登录 Cloudflare → **Workers 和 Pages** → **创建应用程序** → 选择 **创建 Pages**
-3. 选择 **直接上传**，上传下载的 ZIP 包，直接保存并部署
-4. 创建 KV 命名空间：
-   - 左侧进入 **存储和数据库**，点击 **KV**
-   - 点击 **创建命名空间**，名称建议：`VTPanel`
-5. 绑定 KV：进入 Pages 项目 → **设置** → **变量** → **KV 命名空间绑定** → **添加绑定**
-   - 变量名称：`VTPanel`
-   - 选择已创建的 KV 命名空间
-6. 再次上传 ZIP 包并部署，接着访问域名（可以绑定自定义域名，也可使用 pages 默认域名）
+10. 访问该域名，面板与节点由同一个 Worker 提供
 
 ## 使用
 
@@ -65,10 +52,12 @@
 | 密码 | 面板登录凭据，默认 `admin`，登录后修改 |
 | UUID | 节点凭据，也是订阅链接凭据 |
 | 协议类型 | VLESS / Trojan，至少选一个 |
+| 传输类型 | WebSocket / XHTTP / gRPC，至少选一个，可多选。节点名格式为 `协议-传输 备注`，协议 `V`（VLESS）/ `T`（Trojan），传输 `W` / `X` / `G`，如 `V-G 香港`。XHTTP 需客户端支持（mihomo 1.19.22 起、Xray 系新版）；gRPC 需部署在 Workers，并在 Cloudflare 面板开启 gRPC（网络 > gRPC）。Sing-Box 的订阅不出 XHTTP，Surge / Loon / Quantumult X 的订阅只出 WebSocket |
+| gRPC 模式 | `gun` 单流（默认）或 `multi` 多连接复用一条 HTTP/2。`mode` 参数仅 Xray 系客户端读取，mihomo 侧固定单流 |
+| gRPC UA | 覆盖 gRPC 客户端的 User-Agent，可点「获取当前 UA」填入浏览器 UA；留空用客户端自带。Clash 订阅写入 `grpc-opts.grpc-user-agent`，其余格式不含此项 |
 | 订阅转换服务 | subconverter 服务根地址（ZQ-SubApi 即这一层），留空用内置默认；可用环境变量 `SUBCONVERTER_BASE` 指定 |
 | 订阅转换配置文件 | ACL4SSR 规则预设或自填 `.ini` 地址，仅对 Clash 订阅生效；选「不使用」则用服务端默认规则 |
 | ECH | 加密 SNI 绕过 DNS 污染；「高级」里可改 SNI 与 DoH 地址 |
-| 回退检测时间 | 直连无响应多少毫秒后切换下一通道，默认 100 |
 
 ### 节点配置
 
