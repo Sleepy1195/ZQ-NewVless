@@ -499,8 +499,12 @@ function clashTransportHotPatch(clashYaml, { host, byLabel, grpcUA }) {
         }
         return line.replace(/\}$/, `, network: ${transport}, ${optsOf}}`);
     });
-    // subconverter 会把 Xray 的 mode 参数翻成 grpc-mode，mihomo 没有这个字段，留着只会干扰
-    return patched.replace(/,?\s*grpc-mode:\s*[A-Za-z0-9_-]+/g, "");
+    // subconverter 会把 Xray 的 mode 参数翻成 grpc-mode，mihomo 没有这个字段，留着只会干扰；
+    // 它可能排在 grpc-opts 的首位（前面没有逗号、后面有），也可能在末尾，两种都要连逗号一起删，
+    // 否则会剩 `{, grpc-service-name: xxx}` 或 `xxx, , ...` 这种解析不了的流式映射
+    return patched
+        .replace(/grpc-mode:\s*[A-Za-z0-9_-]+\s*,\s*/g, "")
+        .replace(/,\s*grpc-mode:\s*[A-Za-z0-9_-]+/g, "");
 }
 
 function singboxEchHotPatch(singboxText, { uuid, echSni }) {
